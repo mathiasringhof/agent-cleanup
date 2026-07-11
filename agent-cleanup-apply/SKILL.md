@@ -1,44 +1,43 @@
 ---
 name: agent-cleanup-apply
-description: Apply a sealed cleanup plan with drift checks, durable snapshot, validation, locking, and verified rollback. Invoke explicitly with a reviewed run ID.
+description: Back up touched paths and execute the exact approved operations in a reviewed agent-cleanup plan. Invoke explicitly.
 user-invocable: true
 disable-model-invocation: true
 ---
 
 # Agent Cleanup Apply
 
-Apply an already reviewed plan. Explicit invocation with its exact run directory is authorization; do not ask for edit approval again.
+Apply a reviewed cleanup plan exactly as recorded. Require its exact path and resolve the active workspace to its real absolute path. Invocation is apply authorization; do not ask for another confirmation.
 
-## Preflight
+Treat the reviewed plan as read-only. Do not reinterpret findings, generate new content, edit operations, or modify the plan.
 
-1. Require the short run ID and same state root. Show the resolved run directory and target.
-2. Read `references/artifact-contract.md`.
-3. Run:
+## Prepare the change backup
 
-   ```bash
-   node {baseDir}/scripts/apply-run.mjs preflight --run <run-id>
-   ```
+Run prepare first:
 
-4. Stop without touching the workspace if the audit or plan seal is invalid, the operation schema is invalid, a path is outside the target, a protected or symlink path is involved, or any audited source has drifted. Require a fresh audit and review; never rebase the plan here.
+```bash
+node {baseDir}/scripts/apply-run.mjs prepare --plan <plan-path> --workspace <absolute-workspace-path>
+```
 
-## Apply
+The helper defaults to an external backup directory beneath the operator's normal OpenClaw state location. Add `--backup-root <absolute-path>` only when the operator requested another location. The helper rejects draft plans and plans belonging to another workspace. It creates a fresh `.tar.gz` containing `cleanup-plan.json` and the pre-apply content of every existing path touched by an applied write, move, or removal. It does not include untouched workspace content.
+
+If prepare fails or `tar` is unavailable, stop without calling execute. Otherwise report the exact returned `backup_path` before modifying the workspace. Do not ask for confirmation after reporting it.
+
+## Execute the reviewed operations
 
 Run:
 
 ```bash
-node {baseDir}/scripts/apply-run.mjs apply --run <run-id>
+node {baseDir}/scripts/apply-run.mjs execute --plan <plan-path> --workspace <absolute-workspace-path>
 ```
 
-The helper must:
+The generic runner attempts each operation from every `apply` finding in plan order. One failure does not stop later operations, and there is no automatic rollback. It preserves permissions when replacing a text file, creates ordinary non-executable text files, never overwrites move destinations, and never dereferences symlinks contained in moved or removed directories.
 
-- Acquire an exclusive target-workspace lock, then recheck seals and source hashes
-- Create and seal a complete durable snapshot before any target write
-- Execute only the sealed create, replace, move, and remove operations
-- Verify resulting paths and payload hashes
-- Require authoritative `openclaw skills check --json` before and after every skill change
-- Restore and verify the complete pre-apply manifest if any operation or validation fails
-- Seal `result.json`; repeated apply returns the historical result without writes and reports later drift separately
+Report:
 
-Never run arbitrary commands from the plan or from another skill. Never modify dated memory, a symlink, an external skill, or any cleanup-suite file.
+- The previously reported backup path.
+- Every entry in `successes`.
+- Every entry in `failures` with its error.
+- The returned advisory `skill_validation` result. Skill Validation runs only when an attempted operation affects workspace-local skills. Failure or unavailability is reported without rollback.
 
-Report success or restored failure, validation status, result path, and snapshot path. Keep successful snapshots for the operating system or user to remove; do not delete them automatically.
+Do not persist a result artifact. Manual recovery from the backup is the operator's decision.

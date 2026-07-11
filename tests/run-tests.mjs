@@ -1,200 +1,314 @@
 #!/usr/bin/env node
 
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import assert from "node:assert/strict";
-import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
 
 const repo = path.resolve(import.meta.dirname, "..");
-const auditScript = path.join(repo, "agent-cleanup-audit/scripts/audit-run.mjs");
-const reviewScript = path.join(repo, "agent-cleanup-review/scripts/review-run.mjs");
-const applyScript = path.join(repo, "agent-cleanup-apply/scripts/apply-run.mjs");
-const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-cleanup-tests-"));
+const scripts = {
+  audit: path.join(repo, "agent-cleanup-audit/scripts/audit-run.mjs"),
+  review: path.join(repo, "agent-cleanup-review/scripts/review-run.mjs"),
+  apply: path.join(repo, "agent-cleanup-apply/scripts/apply-run.mjs"),
+};
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-cleanup-core-"));
 const workspace = path.join(root, "workspace");
-const state = path.join(root, "state");
+const otherWorkspace = path.join(root, "other-workspace");
+const plans = path.join(root, "plans");
+const backups = path.join(root, "backups");
 const bin = path.join(root, "bin");
 
-function run(script, arguments_, expected = 0) {
-  const result = spawnSync(process.execPath, [script, ...arguments_, "--state-root", state], {
-    encoding: "utf8", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` },
-  });
-  assert.equal(result.status, expected, `${path.basename(script)} ${arguments_.join(" ")}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
-  return result;
-}
-
-function write(file, contents) {
+function write(file, contents, mode) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, contents);
+  fs.writeFileSync(file, contents, mode === undefined ? undefined : { mode });
 }
 
-function fixture(name, value) {
-  const file = path.join(root, `${name}-${crypto.randomBytes(3).toString("hex")}.json`);
+function jsonFile(label, value) {
+  const file = path.join(root, `${label}-${crypto.randomBytes(4).toString("hex")}.json`);
   write(file, `${JSON.stringify(value, null, 2)}\n`);
   return file;
 }
 
-function initWorkspace() {
-  write(path.join(bin, "openclaw"), "#!/bin/sh\nprintf '{\"ok\":true}\\n'\n");
-  fs.chmodSync(path.join(bin, "openclaw"), 0o755);
-  write(path.join(workspace, "AGENTS.md"), "# Rules\n\nKeep durable facts in MEMORY.md.\n");
-  write(path.join(workspace, "USER.md"), "# User\n\nPrefers tea.\n");
-  write(path.join(workspace, "MEMORY.md"), "# Memory\n\nThe user prefers tea.\n");
-  write(path.join(workspace, "BOOTSTRAP.md"), "# Bootstrap\n\nFirst run only.\n");
-  write(path.join(workspace, "memory/2026-07-09.md"), "Historical note.\n");
-  write(path.join(workspace, "skills/example/SKILL.md"), "---\nname: example\ndescription: Example workflow.\n---\n\nDo the example.\n");
-  write(path.join(workspace, "skills/agent-cleanup-audit/SKILL.md"), "---\nname: agent-cleanup-audit\ndescription: Protected cleanup skill.\n---\n");
-}
-
-function initAudit() {
-  const output = JSON.parse(run(auditScript, ["init", "--target", workspace]).stdout);
-  assert.match(output.run_id, /^[a-f0-9]{12}$/);
-  assert.equal(output.target_root, fs.realpathSync(workspace));
-  return output;
-}
-
-function finishAudit(output, summary, paths) {
-  const runDir = output.run_dir;
-  const inventory = JSON.parse(fs.readFileSync(path.join(runDir, "inventory.json")));
-  run(auditScript, ["add-finding", "--run", output.run_id, "--file", fixture("finding", {
-    id: "A001", category: "duplicate", confidence: "high", paths,
-    summary, evidence: "Fixture evidence", recommendation: "Apply fixture change", requires_user: true,
-  })]);
-  for (const item of inventory.source_manifest) run(auditScript, ["cover", "--run", output.run_id, "--file", fixture("coverage", { path: item.path, status: "inspected" })]);
-  write(path.join(runDir, "audit.md"), `# Audit\n\nTarget reviewed completely.\n\n${summary}\n`);
-  run(auditScript, ["seal", "--run", output.run_id]);
-  run(reviewScript, ["init", "--run", output.run_id]);
-  return output;
-}
-
-function newAudit(summary, paths) { return finishAudit(initAudit(), summary, paths); }
-
-function decide(output, input, operations = []) {
-  const operationFiles = operations.map((operation) => {
-    const file = fixture("operation", operation);
-    return path.relative(path.dirname(file), file);
+function run(script, args, { expected = 0, env = {} } = {}) {
+  const result = spawnSync(process.execPath, [script, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, ...env },
   });
-  const decision = fixture("decision", { ...input, operations: operationFiles });
-  run(reviewScript, ["decide", "--run", output.run_id, "--file", decision]);
+  assert.equal(
+    result.status,
+    expected,
+    `${path.basename(script)} ${args.join(" ")}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+  );
+  return result;
 }
 
-function approveReplace(output, targetPath, payloadContents) {
-  const payload = `payload/${crypto.randomBytes(4).toString("hex")}`;
-  write(path.join(output.run_dir, payload), payloadContents);
-  decide(output, {
-    finding_id: "A001", decision: "apply", rationale: "User approved fixture edit",
-    strategies: { [targetPath]: "surgical" },
-  }, [{ id: "C001", type: "replace_file", path: targetPath, payload }]);
-  run(reviewScript, ["seal", "--run", output.run_id]);
+function parse(result) {
+  return JSON.parse(result.stdout);
+}
+
+function finding(id, operations, overrides = {}) {
+  return {
+    id,
+    explanation: `Problem ${id}`,
+    evidence: [{ path: "USER.md", excerpt: "Prefers tea." }],
+    uncertainty: null,
+    intended_outcome: `Resolve ${id}`,
+    decision: "pending",
+    operations,
+    ...overrides,
+  };
+}
+
+function initPlan(label = "plan") {
+  return parse(run(scripts.audit, [
+    "init", "--workspace", workspace, "--plan-root", path.join(plans, label),
+  ])).plan_path;
+}
+
+function add(plan, value) {
+  run(scripts.audit, ["add-finding", "--plan", plan, "--file", jsonFile("finding", value)]);
+}
+
+function finishAudit(plan) {
+  run(scripts.audit, ["finish", "--plan", plan]);
+}
+
+function decide(plan, id, decision) {
+  run(scripts.review, [
+    "decide", "--plan", plan, "--workspace", workspace,
+    "--finding", id, "--decision", decision,
+  ]);
+}
+
+function finishReview(plan) {
+  run(scripts.review, ["finish", "--plan", plan, "--workspace", workspace]);
+}
+
+function createReviewedPlan(label, findings) {
+  const plan = initPlan(label);
+  for (const item of findings) add(plan, item);
+  finishAudit(plan);
+  for (const item of findings) decide(plan, item.id, item.decision === "pending" ? "apply" : item.decision);
+  finishReview(plan);
+  return plan;
+}
+
+function resetWorkspace() {
+  fs.rmSync(workspace, { recursive: true, force: true });
+  write(path.join(workspace, "USER.md"), "# User\n\nPrefers tea.\n", 0o640);
+  write(path.join(workspace, "MEMORY.md"), "# Memory\n\nDurable note.\n");
+  write(path.join(workspace, "old.txt"), "move me\n");
+  write(path.join(workspace, "remove.txt"), "remove me\n");
+  write(path.join(workspace, "untouched.txt"), "keep me\n");
+  write(path.join(workspace, "skills/example/SKILL.md"), "---\nname: example\ndescription: Example.\n---\n");
+  fs.mkdirSync(otherWorkspace, { recursive: true });
 }
 
 try {
-  initWorkspace();
-  const contract = fs.readFileSync(path.join(repo, "docs/artifact-contract.md"));
-  for (const skill of ["agent-cleanup-audit", "agent-cleanup-review", "agent-cleanup-apply"]) {
-    assert.ok(fs.readFileSync(path.join(repo, skill, "references/artifact-contract.md")).equals(contract));
-    assert.doesNotMatch(fs.readFileSync(path.join(repo, skill, "SKILL.md"), "utf8"), /Codex|\/tmp\/openclaw-agent-cleanup/);
+  resetWorkspace();
+  write(path.join(bin, "openclaw"), "#!/bin/sh\nprintf 'validated\\n'\n", 0o755);
+
+  // Audit owns plan creation and validates every mutation.
+  const auditPlan = initPlan("audit");
+  let plan = JSON.parse(fs.readFileSync(auditPlan, "utf8"));
+  assert.equal(plan.workspace, fs.realpathSync(workspace));
+  assert.equal(plan.state, "draft");
+  assert.deepEqual(plan.findings, []);
+  add(auditPlan, finding("F001", [{ type: "write_file", path: "USER.md", content: "# User\n\nPrefers coffee.\n" }]));
+  run(scripts.audit, ["add-finding", "--plan", auditPlan, "--file", jsonFile("duplicate", finding("F001", []))], { expected: 1 });
+  const beforeMalformed = fs.readFileSync(auditPlan, "utf8");
+  run(scripts.audit, ["add-finding", "--plan", auditPlan, "--file", jsonFile("malformed", finding("BAD", [{ type: "command", command: "rm -rf /" }]))], { expected: 1 });
+  assert.equal(fs.readFileSync(auditPlan, "utf8"), beforeMalformed);
+  run(scripts.audit, ["replace-finding", "--plan", auditPlan, "--file", jsonFile("replacement", finding("F001", [{ type: "remove_path", path: "remove.txt" }]))]);
+  finishAudit(auditPlan);
+
+  // Review exposes one pending item, reopens edited decisions, and owns finalization.
+  assert.equal(parse(run(scripts.review, ["next", "--plan", auditPlan, "--workspace", workspace])).id, "F001");
+  run(scripts.review, ["next", "--plan", auditPlan, "--workspace", otherWorkspace], { expected: 1 });
+  decide(auditPlan, "F001", "defer");
+  assert.equal(parse(run(scripts.review, ["next", "--plan", auditPlan, "--workspace", workspace])).finding, null);
+  run(scripts.review, ["replace-finding", "--plan", auditPlan, "--workspace", workspace, "--file", jsonFile("review-replacement", finding("F001", [{ type: "remove_path", path: "remove.txt" }], { decision: "dismiss" }))]);
+  plan = JSON.parse(fs.readFileSync(auditPlan, "utf8"));
+  assert.equal(plan.findings[0].decision, "pending");
+  run(scripts.review, ["finish", "--plan", auditPlan, "--workspace", workspace], { expected: 1 });
+  run(scripts.review, ["add-finding", "--plan", auditPlan, "--workspace", workspace, "--file", jsonFile("new-finding", finding("F002", []))]);
+  decide(auditPlan, "F001", "apply");
+  decide(auditPlan, "F002", "dismiss");
+  finishReview(auditPlan);
+  assert.equal(JSON.parse(fs.readFileSync(auditPlan, "utf8")).state, "reviewed");
+  run(scripts.review, ["replace-finding", "--plan", auditPlan, "--workspace", workspace, "--file", jsonFile("post-review-edit", finding("F001", [{ type: "remove_path", path: "remove.txt" }]))]);
+  plan = JSON.parse(fs.readFileSync(auditPlan, "utf8"));
+  assert.equal(plan.state, "draft");
+  assert.equal(plan.findings[0].decision, "pending");
+  decide(auditPlan, "F001", "dismiss");
+  finishReview(auditPlan);
+
+  // Apply refuses drafts and prepares a change-scoped archive before mutation.
+  const draft = initPlan("draft");
+  run(scripts.apply, ["prepare", "--plan", draft, "--workspace", workspace, "--backup-root", backups], { expected: 1 });
+  resetWorkspace();
+  const applyPlan = createReviewedPlan("apply", [finding("F100", [
+    { type: "write_file", path: "USER.md", content: "# User\n\nPrefers coffee.\n" },
+    { type: "write_file", path: "created.txt", content: "created\n" },
+    { type: "move_path", from: "old.txt", to: "moved.txt" },
+    { type: "remove_path", path: "remove.txt" },
+  ])]);
+  run(scripts.apply, ["prepare", "--plan", applyPlan, "--workspace", otherWorkspace, "--backup-root", backups], { expected: 1 });
+  const prepared = parse(run(scripts.apply, ["prepare", "--plan", applyPlan, "--workspace", workspace, "--backup-root", backups]));
+  assert.ok(fs.existsSync(prepared.backup_path));
+  const archive = spawnSync("tar", ["-tzf", prepared.backup_path], { encoding: "utf8" });
+  assert.equal(archive.status, 0);
+  assert.match(archive.stdout, /cleanup-plan\.json/);
+  assert.match(archive.stdout, /workspace\/USER\.md/);
+  assert.match(archive.stdout, /workspace\/old\.txt/);
+  assert.match(archive.stdout, /workspace\/remove\.txt/);
+  assert.doesNotMatch(archive.stdout, /untouched\.txt/);
+  assert.equal(fs.readFileSync(path.join(workspace, "USER.md"), "utf8"), "# User\n\nPrefers tea.\n");
+
+  const executed = parse(run(scripts.apply, ["execute", "--plan", applyPlan, "--workspace", workspace]));
+  assert.equal(executed.failures.length, 0);
+  assert.equal(executed.successes.length, 4);
+  assert.equal(fs.readFileSync(path.join(workspace, "USER.md"), "utf8"), "# User\n\nPrefers coffee.\n");
+  assert.equal(fs.statSync(path.join(workspace, "USER.md")).mode & 0o777, 0o640);
+  assert.equal(fs.statSync(path.join(workspace, "created.txt")).mode & 0o111, 0);
+  assert.equal(fs.readFileSync(path.join(workspace, "moved.txt"), "utf8"), "move me\n");
+  assert.equal(fs.existsSync(path.join(workspace, "remove.txt")), false);
+  assert.equal(executed.skill_validation.attempted, false);
+  const preparedAgain = parse(run(scripts.apply, ["prepare", "--plan", applyPlan, "--workspace", workspace, "--backup-root", backups]));
+  assert.notEqual(preparedAgain.backup_path, prepared.backup_path);
+  const repeated = parse(run(scripts.apply, ["execute", "--plan", applyPlan, "--workspace", workspace], { expected: 1 }));
+  assert.equal(repeated.successes.length + repeated.failures.length, 4);
+
+  // Invalid targets are rejected, and operation failures do not stop later work.
+  resetWorkspace();
+  const bestEffort = createReviewedPlan("best-effort", [finding("F200", [
+    { type: "move_path", from: "missing.txt", to: "never.txt" },
+    { type: "write_file", path: "created.txt", content: "still ran\n" },
+  ])]);
+  const result = parse(run(scripts.apply, ["execute", "--plan", bestEffort, "--workspace", workspace], { expected: 1 }));
+  assert.equal(result.failures.length, 1);
+  assert.equal(result.successes.length, 1);
+  assert.equal(fs.readFileSync(path.join(workspace, "created.txt"), "utf8"), "still ran\n");
+
+  // Ordered operations may establish a parent used by a later operation.
+  resetWorkspace();
+  write(path.join(workspace, "staged/existing.txt"), "existing\n");
+  const ordered = createReviewedPlan("ordered", [finding("F250", [
+    { type: "move_path", from: "staged", to: "new-dir" },
+    { type: "write_file", path: "new-dir/created.txt", content: "created later\n" },
+  ])]);
+  const orderedResult = parse(run(scripts.apply, ["execute", "--plan", ordered, "--workspace", workspace]));
+  assert.equal(orderedResult.failures.length, 0);
+  assert.equal(fs.readFileSync(path.join(workspace, "new-dir/created.txt"), "utf8"), "created later\n");
+
+  const invalid = initPlan("invalid");
+  for (const operation of [
+    { type: "create_directory", path: "new-dir" },
+    { type: "write_file", path: "../escape.txt", content: "escape\n" },
+    { type: "write_file", path: "USER.md", content_base64: "AAE=" },
+    { type: "chmod", path: "USER.md", mode: "777" },
+  ]) {
+    run(scripts.audit, ["add-finding", "--plan", invalid, "--file", jsonFile("invalid-operation", finding(crypto.randomUUID(), [operation]))], { expected: 1 });
+  }
+  fs.symlinkSync("USER.md", path.join(workspace, "user-link"));
+  run(scripts.audit, ["add-finding", "--plan", invalid, "--file", jsonFile("symlink-operation", finding("SYMLINK", [{ type: "remove_path", path: "user-link" }]))], { expected: 1 });
+  fs.writeFileSync(path.join(workspace, "binary.dat"), Buffer.from([0, 1, 2, 255]));
+  run(scripts.audit, ["add-finding", "--plan", invalid, "--file", jsonFile("binary-operation", finding("BINARY", [{ type: "write_file", path: "binary.dat", content: "text\n" }]))], { expected: 1 });
+  const replaceBinary = createReviewedPlan("replace-binary", [finding("F275", [
+    { type: "remove_path", path: "binary.dat" },
+    { type: "write_file", path: "binary.dat", content: "now text\n" },
+  ])]);
+  const replaceBinaryResult = parse(run(scripts.apply, ["execute", "--plan", replaceBinary, "--workspace", workspace]));
+  assert.equal(replaceBinaryResult.failures.length, 0);
+  assert.equal(fs.readFileSync(path.join(workspace, "binary.dat"), "utf8"), "now text\n");
+  resetWorkspace();
+  fs.writeFileSync(path.join(workspace, "binary.dat"), Buffer.from([0, 1, 2, 255]));
+  write(path.join(workspace, "text.txt"), "text source\n");
+  const moveOverBinary = createReviewedPlan("move-over-binary", [finding("F276", [
+    { type: "remove_path", path: "binary.dat" },
+    { type: "move_path", from: "text.txt", to: "binary.dat" },
+    { type: "write_file", path: "binary.dat", content: "updated text\n" },
+  ])]);
+  run(scripts.apply, ["execute", "--plan", moveOverBinary, "--workspace", workspace]);
+  assert.equal(fs.readFileSync(path.join(workspace, "binary.dat"), "utf8"), "updated text\n");
+  fs.mkdirSync(path.join(workspace, "binary-dir"));
+  fs.writeFileSync(path.join(workspace, "binary-dir/file.dat"), Buffer.from([0, 1, 2, 255]));
+  write(path.join(workspace, "text-dir/file.dat"), "directory text\n");
+  const moveDirectoryOverBinary = createReviewedPlan("move-directory-over-binary", [finding("F277", [
+    { type: "remove_path", path: "binary-dir" },
+    { type: "move_path", from: "text-dir", to: "binary-dir" },
+    { type: "write_file", path: "binary-dir/file.dat", content: "updated directory text\n" },
+  ])]);
+  run(scripts.apply, ["execute", "--plan", moveDirectoryOverBinary, "--workspace", workspace]);
+  assert.equal(fs.readFileSync(path.join(workspace, "binary-dir/file.dat"), "utf8"), "updated directory text\n");
+
+  // Directory moves and removals do not dereference contained links.
+  resetWorkspace();
+  const external = path.join(root, "external.txt");
+  write(external, "outside\n");
+  write(path.join(workspace, "tree/file.txt"), "inside\n");
+  fs.symlinkSync(external, path.join(workspace, "tree/external-link"));
+  const moveDirectory = createReviewedPlan("move-directory", [finding("F300", [{ type: "move_path", from: "tree", to: "moved-tree" }])]);
+  run(scripts.apply, ["execute", "--plan", moveDirectory, "--workspace", workspace]);
+  assert.equal(fs.readFileSync(external, "utf8"), "outside\n");
+  const removeDirectory = createReviewedPlan("remove-directory", [finding("F301", [{ type: "remove_path", path: "moved-tree" }])]);
+  run(scripts.apply, ["execute", "--plan", removeDirectory, "--workspace", workspace]);
+  assert.equal(fs.readFileSync(external, "utf8"), "outside\n");
+
+  // Each operation rechecks live symlink topology after earlier operations.
+  resetWorkspace();
+  write(external, "outside\n");
+  write(path.join(workspace, "source-dir/file.txt"), "inside\n");
+  fs.symlinkSync(external, path.join(workspace, "source-dir/link"));
+  write(path.join(workspace, "dest/old.txt"), "old\n");
+  const liveSymlink = createReviewedPlan("live-symlink", [finding("F350", [
+    { type: "remove_path", path: "dest" },
+    { type: "move_path", from: "source-dir", to: "dest" },
+    { type: "write_file", path: "dest/link", content: "must not escape\n" },
+  ])]);
+  const liveResult = parse(run(scripts.apply, ["execute", "--plan", liveSymlink, "--workspace", workspace], { expected: 1 }));
+  assert.equal(liveResult.successes.length, 2);
+  assert.match(liveResult.failures[0].error, /symlink/);
+  assert.equal(fs.readFileSync(external, "utf8"), "outside\n");
+
+  // Skill Validation is advisory on failure and unavailability.
+  resetWorkspace();
+  const skillPlan = createReviewedPlan("skill", [finding("F400", [{
+    type: "write_file", path: "skills/example/SKILL.md", content: "---\nname: example\ndescription: Fixed.\n---\n",
+  }])]);
+  write(path.join(bin, "openclaw"), "#!/bin/sh\nprintf 'validator failed\\n' >&2\nexit 7\n", 0o755);
+  const skillResult = parse(run(scripts.apply, ["execute", "--plan", skillPlan, "--workspace", workspace]));
+  assert.equal(skillResult.skill_validation.available, true);
+  assert.equal(skillResult.skill_validation.exit_code, 7);
+  assert.equal(skillResult.failures.length, 0);
+  resetWorkspace();
+  const unavailablePlan = createReviewedPlan("skill-unavailable", [finding("F401", [{
+    type: "write_file", path: "skills/example/SKILL.md", content: "---\nname: example\ndescription: Still fixed.\n---\n",
+  }])]);
+  fs.rmSync(path.join(bin, "openclaw"));
+  const unavailableResult = parse(run(scripts.apply, ["execute", "--plan", unavailablePlan, "--workspace", workspace], { env: { PATH: bin } }));
+  assert.equal(unavailableResult.skill_validation.available, false);
+  assert.equal(unavailableResult.failures.length, 0);
+
+  // Each distribution works with no sibling directories present.
+  for (const [phase, source] of Object.entries(scripts)) {
+    const isolated = path.join(root, `isolated-${phase}.mjs`);
+    fs.copyFileSync(source, isolated);
+    const result = spawnSync(process.execPath, [isolated], { encoding: "utf8" });
+    assert.notEqual(result.status, null);
+    assert.doesNotMatch(result.stderr, /ERR_MODULE_NOT_FOUND/);
   }
 
-  const incomplete = initAudit();
-  run(auditScript, ["seal", "--run", incomplete.run_id], 1);
-  const inventoryBefore = fs.readFileSync(path.join(incomplete.run_dir, "inventory.json"), "utf8");
-  const malformedFinding = fixture("finding", { id: "bad", category: "nope" });
-  run(auditScript, ["add-finding", "--run", incomplete.run_id, "--file", malformedFinding], 1);
-  run(auditScript, ["add-finding", "--run", incomplete.run_id, "--file", fixture("finding", {
-    id: "A999", category: "duplicate", confidence: "high", paths: ["../outside"], summary: "Bad", evidence: "Bad", recommendation: "Bad", requires_user: true,
-  })], 1);
-  assert.equal(fs.readFileSync(path.join(incomplete.run_dir, "inventory.json"), "utf8"), inventoryBefore);
-
-  const reviewable = newAudit("Review resume", ["USER.md"]);
-  assert.equal(JSON.parse(run(reviewScript, ["status", "--run", reviewable.run_id]).stdout).pending, 1);
-  assert.equal(JSON.parse(run(reviewScript, ["next-pending", "--run", reviewable.run_id]).stdout).id, "A001");
-  assert.equal(JSON.parse(run(reviewScript, ["init", "--run", reviewable.run_id]).stdout).resumed, true);
-  decide(reviewable, { finding_id: "A001", decision: "defer", rationale: "Wait" });
-  run(reviewScript, ["revise", "--run", reviewable.run_id, "--finding", "A001"]);
-  assert.equal(JSON.parse(run(reviewScript, ["status", "--run", reviewable.run_id]).stdout).pending, 1);
-  write(path.join(workspace, "skills/unrelated-note.txt"), "Unrelated active work.\n");
-  const refreshed = JSON.parse(run(reviewScript, ["refresh", "--run", reviewable.run_id, "--file", fixture("refresh", {
-    changed_paths: ["skills/unrelated-note.txt"], coverage: [{ path: "skills/unrelated-note.txt", status: "inventory-only" }],
-  })]).stdout);
-  assert.deepEqual(refreshed.changed_paths, ["skills/unrelated-note.txt"]);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(reviewable.run_dir, "plan.json"))).refresh_history.length, 1);
-
-  const binding = newAudit("Bound change", ["USER.md"]);
-  const payload = "payload/bad";
-  write(path.join(binding.run_dir, payload), "# Memory\n\nBad.\n");
-  const badOp = fixture("operation", { id: "C001", type: "replace_file", path: "MEMORY.md", payload });
-  const badDecision = fixture("decision", { finding_id: "A001", decision: "apply", rationale: "Bad scope", strategies: { "MEMORY.md": "rewrite" }, operations: [path.relative(root, badOp)] });
-  run(reviewScript, ["decide", "--run", binding.run_id, "--file", badDecision], 1);
-  run(reviewScript, ["approve-expansion", "--run", binding.run_id, "--file", fixture("expansion", { finding_id: "A001", paths: ["MEMORY.md"], rationale: "Related duplicate location" })]);
-  const expandedDecision = fixture("decision", { finding_id: "A001", decision: "apply", rationale: "Approved related edit", scope_expansion: ["MEMORY.md"], strategies: { "MEMORY.md": "rewrite" }, operations: [path.basename(badOp)] });
-  run(reviewScript, ["decide", "--run", binding.run_id, "--file", expandedDecision]);
-
-  const batchAudit = initAudit();
-  const batchInventory = JSON.parse(fs.readFileSync(path.join(batchAudit.run_dir, "inventory.json")));
-  for (const [id, affected] of [["A001", "USER.md"], ["A002", "MEMORY.md"]]) run(auditScript, ["add-finding", "--run", batchAudit.run_id, "--file", fixture("finding", {
-    id, category: "duplicate", confidence: "high", paths: [affected], summary: "Matching duplicate", evidence: "Fixture evidence", recommendation: "Review duplicate", requires_user: true,
-  })]);
-  for (const item of batchInventory.source_manifest) run(auditScript, ["cover", "--run", batchAudit.run_id, "--file", fixture("coverage", { path: item.path, status: "inspected" })]);
-  write(path.join(batchAudit.run_dir, "audit.md"), "# Audit\n\nMatching duplicate findings reviewed completely.\n");
-  run(auditScript, ["seal", "--run", batchAudit.run_id]);
-  run(reviewScript, ["init", "--run", batchAudit.run_id]);
-  run(reviewScript, ["batch-decide", "--run", batchAudit.run_id, "--file", fixture("batch", {
-    matched: [{ finding_id: "A001", paths: ["USER.md"] }, { finding_id: "A002", paths: ["MEMORY.md"] }],
-    decisions: [{ finding_id: "A001", decision: "defer", rationale: "Batch wait" }, { finding_id: "A002", decision: "defer", rationale: "Batch wait" }],
-  })]);
-  assert.equal(JSON.parse(run(reviewScript, ["status", "--run", batchAudit.run_id]).stdout).pending, 0);
-  const batchPlanBefore = fs.readFileSync(path.join(batchAudit.run_dir, "plan.json"));
-  const batchDecisionBefore = fs.readFileSync(path.join(batchAudit.run_dir, "decisions/A001.json"));
-  run(reviewScript, ["batch-decide", "--run", batchAudit.run_id, "--file", fixture("batch", {
-    matched: [{ finding_id: "A001", paths: ["USER.md"] }, { finding_id: "A002", paths: ["MEMORY.md"] }],
-    decisions: [{ finding_id: "A001", decision: "dismiss", rationale: "Invalid redo" }, { finding_id: "A002", decision: "dismiss", rationale: "Invalid redo" }],
-  })], 1);
-  assert.ok(fs.readFileSync(path.join(batchAudit.run_dir, "plan.json")).equals(batchPlanBefore));
-  assert.ok(fs.readFileSync(path.join(batchAudit.run_dir, "decisions/A001.json")).equals(batchDecisionBefore));
-
-  const attribution = newAudit("Attribution check", ["USER.md"]);
-  decide(attribution, { finding_id: "A001", decision: "defer", rationale: "No operation approved" });
-  const attributionPlanFile = path.join(attribution.run_dir, "plan.json");
-  const attributionPlan = JSON.parse(fs.readFileSync(attributionPlanFile));
-  attributionPlan.operations.push({ id: "C999", type: "remove_path", path: "USER.md", expected_before: attributionPlan.source_manifest.find((item) => item.path === "USER.md").sha256 });
-  fs.writeFileSync(attributionPlanFile, `${JSON.stringify(attributionPlan, null, 2)}\n`);
-  run(reviewScript, ["seal", "--run", attribution.run_id], 1);
-
-  const happy = newAudit("Deduplicate user preference", ["USER.md", "MEMORY.md"]);
-  approveReplace(happy, "USER.md", "# User\n\nPrefers coffee.\n");
-  run(applyScript, ["preflight", "--run", happy.run_id]);
-  const applied = JSON.parse(run(applyScript, ["apply", "--run", happy.run_id]).stdout);
-  assert.match(fs.readFileSync(path.join(workspace, "USER.md"), "utf8"), /coffee/);
-  assert.equal(applied.status, "applied");
-  assert.ok(applied.plan_sha256 && applied.post_apply_manifest.length);
-  assert.ok(fs.existsSync(path.join(happy.run_dir, "result.sha256")));
-  assert.equal(JSON.parse(run(applyScript, ["apply", "--run", happy.run_id]).stdout).historical, true);
-  fs.appendFileSync(path.join(workspace, "AGENTS.md"), "Later drift.\n");
-  assert.equal(JSON.parse(run(applyScript, ["preflight", "--run", happy.run_id]).stdout).current_workspace_matches, false);
-  fs.writeFileSync(path.join(workspace, "AGENTS.md"), "# Rules\n\nKeep durable facts in MEMORY.md.\n");
-
-  const drift = newAudit("Change memory", ["MEMORY.md"]);
-  approveReplace(drift, "MEMORY.md", "# Memory\n\nUpdated.\n");
-  fs.appendFileSync(path.join(workspace, "MEMORY.md"), "Concurrent change.\n");
-  run(applyScript, ["preflight", "--run", drift.run_id], 1);
-
-  const skill = newAudit("Fix skill", ["skills/example/SKILL.md"]);
-  const originalSkill = fs.readFileSync(path.join(workspace, "skills/example/SKILL.md"), "utf8");
-  approveReplace(skill, "skills/example/SKILL.md", "---\nname: example\ndescription: Fixed.\n---\n\nFixed.\n");
-  fs.writeFileSync(path.join(bin, "openclaw"), "#!/bin/sh\nexit 1\n");
-  const failed = run(applyScript, ["apply", "--run", skill.run_id], 1);
-  assert.match(failed.stderr, /authoritative OpenClaw skill validation/);
-  assert.equal(fs.readFileSync(path.join(workspace, "skills/example/SKILL.md"), "utf8"), originalSkill);
-
-  const retained = JSON.parse(run(auditScript, ["list"]).stdout);
-  assert.ok(retained.runs.some((item) => item.run_id === happy.run_id));
-  const preview = JSON.parse(run(auditScript, ["prune", "--run", incomplete.run_id]).stdout);
-  assert.equal(preview.confirmed, false);
-  assert.ok(fs.existsSync(incomplete.run_dir));
-  run(auditScript, ["prune", "--run", incomplete.run_id, "--confirm"]);
-  assert.equal(fs.existsSync(incomplete.run_dir), false);
+  // Tar failure aborts prepare without touching the workspace.
+  resetWorkspace();
+  const tarPlan = createReviewedPlan("tar-failure", [finding("F500", [{ type: "remove_path", path: "remove.txt" }])]);
+  run(scripts.apply, ["prepare", "--plan", tarPlan, "--workspace", workspace, "--backup-root", backups], { expected: 1, env: { PATH: bin } });
+  assert.equal(fs.existsSync(path.join(workspace, "remove.txt")), true);
+  write(path.join(bin, "tar"), "#!/bin/sh\nprintf 'archive failed\\n' >&2\nexit 9\n", 0o755);
+  run(scripts.apply, ["prepare", "--plan", tarPlan, "--workspace", workspace, "--backup-root", backups], { expected: 1, env: { PATH: bin } });
+  assert.equal(fs.existsSync(path.join(workspace, "remove.txt")), true);
 
   console.log("all tests passed");
 } finally {
