@@ -22,13 +22,45 @@ function parseArgs(argv) {
 }
 
 function fail(message) { throw new Error(message); }
-const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+
+function expandTilde(value, home) {
+  if (value === "~") return home;
+  if (value.startsWith("~/")) return path.join(home, value.slice(2));
+  return value;
+}
+
+function openClawStateDirectory() {
+  const systemHome = process.env.HOME || os.homedir();
+  const openClawHome = path.resolve(expandTilde(process.env.OPENCLAW_HOME || systemHome, systemHome));
+  if (process.env.OPENCLAW_STATE_DIR) return path.resolve(expandTilde(process.env.OPENCLAW_STATE_DIR, systemHome));
+  return path.join(openClawHome, ".openclaw");
+}
 
 function safePath(value, label = "path") {
   if (typeof value !== "string" || !value || value.includes("\0")) fail(`${label} must be a non-empty relative path`);
   const normalized = path.posix.normalize(value.replaceAll("\\", "/"));
   if (normalized !== value || normalized === "." || normalized.startsWith("../") || path.posix.isAbsolute(normalized)) fail(`${label} must stay inside the workspace`);
   return normalized;
+}
+
+const rootKnowledgeFiles = new Set([
+  "SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md",
+  "HEARTBEAT.md", "MEMORY.md", "BOOTSTRAP.md",
+]);
+const cleanupSkillNames = new Set(["audit", "review", "apply"].map((phase) => `agent-cleanup-${phase}`));
+
+function cleanupScopePath(value, label = "path") {
+  const relative = safePath(value, label);
+  if (rootKnowledgeFiles.has(relative)) return relative;
+  const skillRoot = relative.startsWith("skills/")
+    ? "skills/"
+    : relative.startsWith(".agents/skills/") ? ".agents/skills/" : null;
+  if (!skillRoot) fail(`${label} is outside the cleanup scope: ${relative}`);
+  const skillRelative = relative.slice(skillRoot.length);
+  if (!skillRelative) fail(`${label} must target a skill-root descendant: ${relative}`);
+  const skillParts = skillRelative.split("/");
+  if (skillParts.some((part) => cleanupSkillNames.has(part))) fail(`${label} targets the agent-cleanup suite: ${relative}`);
+  return relative;
 }
 
 function rejectSymlinkTraversal(workspace, relative) {
@@ -58,16 +90,16 @@ function validateOperation(operation, workspace) {
   if (!operation || typeof operation !== "object" || Array.isArray(operation)) fail("operation must be an object");
   let allowed;
   if (operation.type === "write_file") {
-    safePath(operation.path);
+    cleanupScopePath(operation.path);
     if (typeof operation.content !== "string" || operation.content.includes("\0")) fail("write_file requires complete text content");
     rejectSymlinkTraversal(workspace, operation.path);
     allowed = new Set(["type", "path", "content"]);
   } else if (operation.type === "move_path") {
-    safePath(operation.from, "move source"); safePath(operation.to, "move destination");
+    cleanupScopePath(operation.from, "move source"); cleanupScopePath(operation.to, "move destination");
     rejectSymlinkTraversal(workspace, operation.from); rejectSymlinkTraversal(workspace, operation.to);
     allowed = new Set(["type", "from", "to"]);
   } else if (operation.type === "remove_path") {
-    safePath(operation.path); rejectSymlinkTraversal(workspace, operation.path);
+    cleanupScopePath(operation.path); rejectSymlinkTraversal(workspace, operation.path);
     allowed = new Set(["type", "path"]);
   } else fail(`unsupported operation type: ${operation.type || "missing"}`);
   for (const key of Object.keys(operation)) if (!allowed.has(key)) fail(`unsupported operation field: ${key}`);
@@ -77,7 +109,8 @@ function loadPlan(options) {
   if (!options.plan || !options.workspace) fail("--plan and --workspace are required");
   const planPath = path.resolve(options.plan);
   if (fs.lstatSync(planPath).isSymbolicLink()) fail("cleanup plan cannot be a symlink");
-  const plan = readJson(planPath);
+  const planContents = fs.readFileSync(planPath);
+  const plan = JSON.parse(planContents);
   const workspace = fs.realpathSync(path.resolve(options.workspace));
   if (plan.workspace !== workspace) fail("cleanup plan belongs to a different workspace");
   if (planPath === workspace || planPath.startsWith(`${workspace}${path.sep}`)) fail("cleanup plan must stay outside the workspace");
@@ -90,7 +123,7 @@ function loadPlan(options) {
       if (finding.decision === "apply") operations.push({ finding: finding.id, index, operation: finding.operations[index] });
     }
   }
-  return { planPath, plan, workspace, operations };
+  return { planPath, plan, planContents, workspace, operations };
 }
 
 function operationPaths(operation) {
@@ -112,8 +145,7 @@ function existingBackupRoots(workspace, operations) {
 
 function prepare(options) {
   const context = loadPlan(options);
-  const state = process.env.XDG_STATE_HOME || path.join(process.env.HOME || os.homedir(), ".local", "state");
-  const requestedRoot = path.resolve(options["backup-root"] || path.join(state, "openclaw", "agent-cleanup", "backups"));
+  const requestedRoot = path.resolve(options["backup-root"] || path.join(openClawStateDirectory(), "agent-cleanup", "backups"));
   fs.mkdirSync(requestedRoot, { recursive: true, mode: 0o700 });
   const backupRoot = fs.realpathSync(requestedRoot);
   if (backupRoot === context.workspace || backupRoot.startsWith(`${context.workspace}${path.sep}`)) fail("backup root must be outside the workspace");
@@ -145,6 +177,23 @@ function operationLabel(item) {
   return `${item.finding}:${item.index + 1}:${item.operation.type}`;
 }
 
+function verifyPreparedBackup(context, options) {
+  if (!options.backup) fail("execute requires the backup path returned by prepare");
+  const backupPath = path.resolve(options.backup);
+  if (fs.lstatSync(backupPath).isSymbolicLink()) fail("change backup cannot be a symlink");
+  const realBackupPath = fs.realpathSync(backupPath);
+  if (!fs.statSync(realBackupPath).isFile()) fail("change backup must be a regular file");
+  if (realBackupPath === context.workspace || realBackupPath.startsWith(`${context.workspace}${path.sep}`)) fail("change backup must stay outside the workspace");
+  const planContents = context.planContents;
+  const extracted = spawnSync("tar", ["-xOzf", realBackupPath, "cleanup-plan.json"], {
+    maxBuffer: Math.max(10 * 1024 * 1024, planContents.length * 2),
+  });
+  if (extracted.error) fail(`change backup verification failed: ${extracted.error.message}`);
+  if (extracted.status !== 0) fail(`change backup verification failed: ${extracted.stderr.toString().trim() || `tar exited ${extracted.status}`}`);
+  if (!planContents.equals(extracted.stdout)) fail("change backup contains a different cleanup plan");
+  return realBackupPath;
+}
+
 function executeOperation(workspace, operation) {
   validateOperation(operation, workspace);
   if (operation.type === "write_file") {
@@ -171,7 +220,9 @@ function executeOperation(workspace, operation) {
 }
 
 function skillValidation(workspace, operations) {
-  const changesSkills = operations.some(({ operation }) => operationPaths(operation).some((relative) => relative === "skills" || relative.startsWith("skills/")));
+  const changesSkills = operations.some(({ operation }) => operationPaths(operation).some((relative) => (
+    relative.startsWith("skills/") || relative.startsWith(".agents/skills/")
+  )));
   if (!changesSkills) return { attempted: false, available: null, exit_code: null, stdout: "", stderr: "" };
   const result = spawnSync("openclaw", ["skills", "check", "--json"], { cwd: workspace, encoding: "utf8", timeout: 30_000 });
   return {
@@ -185,6 +236,7 @@ function skillValidation(workspace, operations) {
 
 function execute(options) {
   const context = loadPlan(options);
+  const backupPath = verifyPreparedBackup(context, options);
   const successes = [];
   const failures = [];
   for (const item of context.operations) {
@@ -196,7 +248,7 @@ function execute(options) {
       failures.push({ operation: label, error: error.message });
     }
   }
-  const result = { successes, failures, skill_validation: skillValidation(context.workspace, context.operations) };
+  const result = { backup_path: backupPath, successes, failures, skill_validation: skillValidation(context.workspace, context.operations) };
   console.log(JSON.stringify(result, null, 2));
   if (failures.length) process.exitCode = 1;
 }

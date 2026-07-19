@@ -5,7 +5,7 @@ Agent Cleanup identifies and removes evidenced cruft from an OpenClaw workspace 
 ## Language
 
 **Cleanup Scope**:
-The active workspace's root OpenClaw knowledge files, dated memory used as read-only evidence, and workspace-local skills with their support files. External skills and the agent-cleanup suite itself are outside this boundary.
+The active workspace's root OpenClaw knowledge files, dated memory used as read-only evidence, and workspace-resident skills under `skills/` and `.agents/skills/` with their support files. External skills and the agent-cleanup suite itself are outside this boundary. Cleanup helpers reject operations outside this boundary.
 _Avoid_: Agent environment, installed skills
 
 **Target Workspace**:
@@ -25,7 +25,7 @@ Workspace knowledge or skill content with evidence of duplication, contradiction
 _Avoid_: Old content, verbose content, untidy content
 
 **Cleanup Plan**:
-The sole persisted handoff document created by the audit helper outside the target workspace, refined through review-helper commands, and executed by apply through its exact path. Direct editing is unsupported. It contains findings, evidence, decisions, and exact cleanup operations; human-readable presentation occurs in conversation.
+The sole persisted handoff document created by the audit helper outside the target workspace, normally beneath the active OpenClaw state directory, refined through review-helper commands, and executed by apply through its exact path. Direct editing is unsupported. It contains findings, evidence, decisions, and exact cleanup operations; human-readable presentation occurs in conversation.
 _Avoid_: Audit manifest, artifact set
 
 **Finding**:
@@ -57,7 +57,7 @@ One independently installable audit, review, or apply skill containing its own i
 _Avoid_: Plugin suite, shared installation
 
 **Change Backup**:
-A `.tar.gz` archive containing the reviewed plan and the pre-apply content at every existing path that the plan will modify, move, or remove. It does not contain untouched workspace content and supports manual rather than automatic recovery.
+A `.tar.gz` archive containing the reviewed plan and the pre-apply content at every existing path that the plan will modify, move, or remove. It does not contain untouched workspace content and supports manual rather than automatic recovery. Apply execution requires its exact path and verifies that its embedded plan is byte-for-byte identical to the plan being executed.
 _Avoid_: Workspace snapshot, full backup
 
 **Apply Authorization**:

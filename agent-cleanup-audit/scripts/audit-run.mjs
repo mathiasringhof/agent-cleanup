@@ -29,9 +29,21 @@ function writeJson(file, value) {
   fs.renameSync(temporary, file);
 }
 
+function expandTilde(value, home) {
+  if (value === "~") return home;
+  if (value.startsWith("~/")) return path.join(home, value.slice(2));
+  return value;
+}
+
+function openClawStateDirectory() {
+  const systemHome = process.env.HOME || os.homedir();
+  const openClawHome = path.resolve(expandTilde(process.env.OPENCLAW_HOME || systemHome, systemHome));
+  if (process.env.OPENCLAW_STATE_DIR) return path.resolve(expandTilde(process.env.OPENCLAW_STATE_DIR, systemHome));
+  return path.join(openClawHome, ".openclaw");
+}
+
 function defaultPlanRoot() {
-  const state = process.env.XDG_STATE_HOME || path.join(process.env.HOME || os.homedir(), ".local", "state");
-  return path.join(state, "openclaw", "agent-cleanup");
+  return path.join(openClawStateDirectory(), "agent-cleanup");
 }
 
 function safePath(value, label = "path") {
@@ -39,6 +51,26 @@ function safePath(value, label = "path") {
   const normalized = path.posix.normalize(value.replaceAll("\\", "/"));
   if (normalized !== value || normalized === "." || normalized.startsWith("../") || path.posix.isAbsolute(normalized)) fail(`${label} must stay inside the workspace`);
   return normalized;
+}
+
+const rootKnowledgeFiles = new Set([
+  "SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md", "TOOLS.md",
+  "HEARTBEAT.md", "MEMORY.md", "BOOTSTRAP.md",
+]);
+const cleanupSkillNames = new Set(["audit", "review", "apply"].map((phase) => `agent-cleanup-${phase}`));
+
+function cleanupScopePath(value, label = "path") {
+  const relative = safePath(value, label);
+  if (rootKnowledgeFiles.has(relative)) return relative;
+  const skillRoot = relative.startsWith("skills/")
+    ? "skills/"
+    : relative.startsWith(".agents/skills/") ? ".agents/skills/" : null;
+  if (!skillRoot) fail(`${label} is outside the cleanup scope: ${relative}`);
+  const skillRelative = relative.slice(skillRoot.length);
+  if (!skillRelative) fail(`${label} must target a skill-root descendant: ${relative}`);
+  const skillParts = skillRelative.split("/");
+  if (skillParts.some((part) => cleanupSkillNames.has(part))) fail(`${label} targets the agent-cleanup suite: ${relative}`);
+  return relative;
 }
 
 function rejectSymlinkTraversal(workspace, relative) {
@@ -84,18 +116,18 @@ function rejectOrderedBinaryRewrite(workspace, relative, priorOperations) {
 function validateOperation(operation, workspace) {
   if (!operation || typeof operation !== "object" || Array.isArray(operation)) fail("operation must be an object");
   if (operation.type === "write_file") {
-    safePath(operation.path);
+    cleanupScopePath(operation.path);
     if (typeof operation.content !== "string" || operation.content.includes("\0")) fail("write_file requires complete text content");
     rejectSymlinkTraversal(workspace, operation.path);
     const target = path.join(workspace, operation.path);
     if (fs.existsSync(target) && !fs.statSync(target).isFile()) fail("write_file target must be a regular file or a new file");
   } else if (operation.type === "move_path") {
-    safePath(operation.from, "move source");
-    safePath(operation.to, "move destination");
+    cleanupScopePath(operation.from, "move source");
+    cleanupScopePath(operation.to, "move destination");
     rejectSymlinkTraversal(workspace, operation.from);
     rejectSymlinkTraversal(workspace, operation.to);
   } else if (operation.type === "remove_path") {
-    safePath(operation.path);
+    cleanupScopePath(operation.path);
     rejectSymlinkTraversal(workspace, operation.path);
   } else fail(`unsupported operation type: ${operation.type || "missing"}`);
   const keys = {

@@ -71,7 +71,7 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 - Implement three explicitly user-invoked skills named `agent-cleanup-audit`, `agent-cleanup-review`, and `agent-cleanup-apply`.
 - Each skill includes its own instructions and phase-specific Node.js helper. No installed phase imports code from a sibling skill or shared runtime library.
 - Cleanup always targets the active workspace. Audit records its real absolute path in the plan; review and apply reject the plan when invoked from another workspace.
-- Store each plan in a timestamped directory under the user's normal OpenClaw state location, outside the target workspace. Audit returns the exact plan path; review and apply require that path.
+- Store each plan in a timestamped directory beneath `OPENCLAW_STATE_DIR/agent-cleanup`, or beneath `OPENCLAW_HOME/.openclaw/agent-cleanup` when no explicit state directory is configured, outside the target workspace. Audit returns the exact plan path; review and apply require that path.
 - Do not add run IDs, run lookup, artifact listing, retention policies, pruning, schema versions, SHA seals, source manifests, drift detection, locks, or result artifacts.
 - `cleanup-plan.json` is the only persisted audit/review handoff. Human-readable findings and diffs are rendered in conversation rather than duplicated into Markdown reports.
 - Direct plan editing is unsupported. Helpers are the normal writers of the plan and validate every input before updating it.
@@ -83,9 +83,10 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 - Review processes one finding at a time. Before presenting it, the skill rereads every affected live file and uses the live content to render before/after differences. The plan stores intended new content, not copies of old file content.
 - Review decisions are `apply`, `defer`, and `dismiss`. Only operations attached to applied findings are executed; deferred and dismissed findings retain their proposed operations as non-executed context.
 - Audit and review never modify target workspace content. Their only filesystem writes are plan-helper writes beneath the external plan directory.
-- Audit the active workspace's root OpenClaw knowledge files, dated memory, and workspace-local skills with their referenced and unreferenced support files.
+- Audit the active workspace's root OpenClaw knowledge files, dated memory, and workspace-resident skills beneath `skills/` and `.agents/skills/` with their referenced and unreferenced support files.
 - Exclude external, shared, managed, bundled, and plugin-provided skills. Exclude every installed agent-cleanup skill from its own cleanup scope.
 - Treat dated memory as immutable historical evidence. It may support a finding but may never be an operation target.
+- Enforce Cleanup Scope in every helper. Operations may target only the listed root knowledge files or descendants of `skills/` and `.agents/skills/`; reject other workspace paths, dated memory, and every agent-cleanup skill directory.
 - Record every symlink. Inspect its target content only when the resolved target remains inside the active workspace. Identify but do not inspect external targets.
 - Reject operations that directly target a symlink or traverse one. A move or removal of a containing directory may move or remove contained symlink entries, but the runner never dereferences them or modifies their targets.
 - Use canonical ownership when classifying misplaced information: `SOUL.md` owns persona and behavioral boundaries; `IDENTITY.md` owns stable identity metadata; `USER.md` owns user facts and preferences; `AGENTS.md` owns workspace-wide operating instructions; `TOOLS.md` owns environment and tool notes; `HEARTBEAT.md` owns heartbeat work; `MEMORY.md` owns curated durable knowledge; dated memory owns historical observations; and skills own reusable task procedures.
@@ -103,7 +104,7 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 - Apply's helper is a generic cleanup runner with separate `prepare` and `execute` commands. Both treat the reviewed plan as read-only.
 - `prepare` validates the reviewed plan and uses the system `tar` command to create a timestamped `.tar.gz` outside the workspace. The archive contains the reviewed plan and the complete pre-apply content at every existing path targeted by an applied write, move, or removal. Duplicate and nested touched paths are archived once.
 - If `tar` is unavailable or backup creation fails, prepare aborts and execute is not called.
-- After prepare, the skill reports the archive's exact path. Explicit invocation of apply is already authorization, so no additional confirmation occurs.
+- After prepare, the skill reports the archive's exact path. Execute requires that path, extracts the embedded cleanup plan, and rejects execution unless it is byte-for-byte identical to the plan being executed. Explicit invocation of apply is already authorization, so no additional confirmation occurs.
 - `execute` attempts every applied operation in order. Failure of one operation is recorded and does not prevent later operations from being attempted. No automatic rollback or recovery verification occurs.
 - Reapplying a reviewed plan has no special replay protection. Each invocation creates a fresh change backup and attempts every operation again.
 - After execution, report the backup path, every successful operation, every failed operation with its error, and any validation result. Do not persist a separate result artifact.
@@ -123,9 +124,12 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 - Verify prepare fails before mutation when `tar` is unavailable or archive creation fails.
 - Verify complete text-file writes, new file creation, permission preservation, moves, and removals.
 - Verify out-of-workspace paths, directory creation, direct symlink operations, permission changes, binary writes, and arbitrary commands are rejected.
+- Verify operations outside Cleanup Scope, dated-memory targets, and agent-cleanup targets are rejected by audit, review, and apply, while both workspace-resident skill roots remain valid.
 - Verify directory moves and removals do not dereference contained symlinks.
 - Verify execution continues after an operation failure and reports successes and failures separately.
 - Verify repeated apply invocations create fresh backups and attempt the plan again.
+- Verify execute refuses a missing backup path or a backup containing a different cleanup plan.
+- Verify default plan and backup paths honor `OPENCLAW_STATE_DIR` and `OPENCLAW_HOME`.
 - Verify OpenClaw validation runs after local-skill changes, is skipped for knowledge-only changes, and reports failure or unavailability without rollback.
 - Verify the three skill distributions operate without sibling skill directories present.
 

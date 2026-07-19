@@ -36,6 +36,8 @@ node {baseDir}/scripts/review-run.mjs add-finding --plan <plan-path> --workspace
 
 Replacement always resets the decision to `pending`, including for a previously decided finding. Never edit the plan directly.
 
+The helper rejects proposed operations outside the cleanup scope: listed root knowledge files and workspace-resident skills under `skills/` or `.agents/skills/`, excluding dated memory and the agent-cleanup suite.
+
 Record the operator's decision:
 
 ```bash

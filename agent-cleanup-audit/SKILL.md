@@ -17,13 +17,13 @@ Resolve the active workspace to its real absolute path, then run:
 node {baseDir}/scripts/audit-run.mjs init --workspace <absolute-workspace-path>
 ```
 
-Use `--plan-root <absolute-path>` only when the operator requested a different external state location. Keep the returned exact `plan_path`; review and apply require it. Read that plan's `skill_validation` entry and report when OpenClaw skill validation was unavailable or failed.
+The helper defaults beneath `OPENCLAW_STATE_DIR`, or beneath `OPENCLAW_HOME/.openclaw` when no explicit state directory is configured. Use `--plan-root <absolute-path>` only when the operator requested a different external state location. Keep the returned exact `plan_path`; review and apply require it. Read that plan's `skill_validation` entry and report when OpenClaw skill validation was unavailable or failed.
 
 ## Inspect the cleanup scope
 
 Read the root knowledge files that exist: `SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`, `BOOTSTRAP.md`, and any dated files under `memory/`. Treat `BOOTSTRAP.md` as setup/template material rather than a durable canonical owner. Dated memory is historical evidence only and can never be an operation target.
 
-Inspect workspace-local skills and their support files. Fully inspect each `SKILL.md` and referenced support file, and inventory unreferenced files. Exclude external, shared, managed, bundled, and plugin skills. Exclude every `agent-cleanup-audit`, `agent-cleanup-review`, and `agent-cleanup-apply` skill directory.
+Inspect workspace-resident skills under `skills/` and `.agents/skills/` and their support files. Fully inspect each `SKILL.md` and referenced support file, and inventory unreferenced files. Exclude external, shared, managed, bundled, and plugin skills. Exclude every `agent-cleanup-audit`, `agent-cleanup-review`, and `agent-cleanup-apply` skill directory.
 
 Record every symlink as evidence. Inspect target content only when its resolved target stays inside the active workspace. Identify external targets without inspecting them. Never propose an operation that directly targets or traverses a symlink.
 
@@ -66,6 +66,8 @@ Use a concise uncertainty string instead of `null` when judgment is ambiguous. E
 - `write_file`: `path` and complete text `content`; the parent directory must already exist.
 - `move_path`: exact `from` and `to`; the destination is never overwritten.
 - `remove_path`: exact `path`.
+
+Every operation path must be one of the listed root knowledge files or a descendant of `skills/` or `.agents/skills/`. Dated memory, other workspace paths, and the agent-cleanup suite are evidence-only and cannot be operation targets. The helper enforces this boundary.
 
 Submit each finding through the helper:
 
