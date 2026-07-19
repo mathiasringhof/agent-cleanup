@@ -45,7 +45,7 @@ The operator's resolution of a review item: apply its operations, defer it for l
 _Avoid_: Approval status
 
 **Cleanup Operation**:
-One deterministic filesystem change in a reviewed plan: write a complete text file, move an existing path, or remove an existing path. A write stores only the approved final content; review reads the live file to present the before/after difference. Rewrites preserve existing permissions and new files are non-executable. Operations cannot create directories, change permissions, directly mutate symlinks, or execute commands.
+One deterministic filesystem change in a reviewed plan: write a complete text file, move an existing path, or remove an existing path. A write stores only the approved final content; review reads the live file to present the before/after difference. Rewrites preserve the existing Unix permission mode and new files are non-executable. Operations cannot create directories, change permission modes, directly mutate symlinks, or execute commands.
 _Avoid_: Command, instruction
 
 **Cleanup Runner**:
@@ -64,9 +64,9 @@ _Avoid_: Workspace snapshot, full backup
 The operator's explicit invocation of apply for a reviewed plan. No additional confirmation is required after the change backup succeeds.
 _Avoid_: Final approval prompt
 
-**Best-Effort Apply**:
-Execution of every approved cleanup operation even when an earlier operation fails. Apply reports failures and relies on the change backup for manual recovery.
-_Avoid_: Transaction, automatic rollback
+**Finding-Scoped Apply**:
+Execution of approved cleanup operations in plan order, stopping the remainder of a finding after its first failure while continuing with later independent findings. Apply reports failures and skipped operations and relies on the change backup for manual recovery.
+_Avoid_: Operation-by-operation best effort, transaction, automatic rollback
 
 **Skill Validation**:
 An advisory OpenClaw compatibility check used during audit as evidence and after applying workspace-local skill changes. Failure or unavailability is reported without automatic rollback.

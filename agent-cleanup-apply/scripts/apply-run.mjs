@@ -120,7 +120,7 @@ function loadPlan(options) {
     if (!finding || typeof finding.id !== "string" || !["apply", "defer", "dismiss"].includes(finding.decision) || !Array.isArray(finding.operations)) fail("cleanup plan contains an invalid finding");
     for (let index = 0; index < finding.operations.length; index += 1) {
       validateOperation(finding.operations[index], workspace);
-      if (finding.decision === "apply") operations.push({ finding: finding.id, index, operation: finding.operations[index] });
+      if (finding.decision === "apply") operations.push({ findingId: finding.id, index, operation: finding.operations[index] });
     }
   }
   return { planPath, plan, planContents, workspace, operations };
@@ -174,7 +174,7 @@ function prepare(options) {
 }
 
 function operationLabel(item) {
-  return `${item.finding}:${item.index + 1}:${item.operation.type}`;
+  return `${item.findingId}:${item.index + 1}:${item.operation.type}`;
 }
 
 function verifyPreparedBackup(context, options) {
@@ -194,6 +194,29 @@ function verifyPreparedBackup(context, options) {
   return realBackupPath;
 }
 
+function replaceFileAtomically(target, content, permissionMode) {
+  const temporary = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.agent-cleanup-${process.pid}-${crypto.randomBytes(6).toString("hex")}.tmp`,
+  );
+  let descriptor;
+  try {
+    descriptor = fs.openSync(temporary, "wx", 0o600);
+    fs.writeFileSync(descriptor, content);
+    fs.fchmodSync(descriptor, permissionMode & 0o7777);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(temporary, target);
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* preserve original error */ }
+    }
+    try { fs.rmSync(temporary, { force: true }); } catch { /* preserve original error */ }
+    throw error;
+  }
+}
+
 function executeOperation(workspace, operation) {
   validateOperation(operation, workspace);
   if (operation.type === "write_file") {
@@ -202,8 +225,9 @@ function executeOperation(workspace, operation) {
     const parent = path.dirname(target);
     if (!fs.existsSync(parent) || !fs.statSync(parent).isDirectory()) fail(`parent directory does not exist: ${operation.path}`);
     if (fs.existsSync(target)) {
-      if (!fs.statSync(target).isFile()) fail(`write target is not a regular file: ${operation.path}`);
-      fs.writeFileSync(target, operation.content);
+      const targetStat = fs.statSync(target);
+      if (!targetStat.isFile()) fail(`write target is not a regular file: ${operation.path}`);
+      replaceFileAtomically(target, operation.content, targetStat.mode);
     } else fs.writeFileSync(target, operation.content, { mode: 0o644, flag: "wx" });
   } else if (operation.type === "move_path") {
     const source = path.join(workspace, operation.from);
@@ -239,16 +263,25 @@ function execute(options) {
   const backupPath = verifyPreparedBackup(context, options);
   const successes = [];
   const failures = [];
+  const skipped = [];
+  const attempted = [];
+  const failedFindingIds = new Set();
   for (const item of context.operations) {
     const label = operationLabel(item);
+    if (failedFindingIds.has(item.findingId)) {
+      skipped.push({ operation: label, reason: `earlier operation failed in finding ${item.findingId}` });
+      continue;
+    }
+    attempted.push(item);
     try {
       executeOperation(context.workspace, item.operation);
       successes.push({ operation: label });
     } catch (error) {
       failures.push({ operation: label, error: error.message });
+      failedFindingIds.add(item.findingId);
     }
   }
-  const result = { backup_path: backupPath, successes, failures, skill_validation: skillValidation(context.workspace, context.operations) };
+  const result = { backup_path: backupPath, successes, failures, skipped, skill_validation: skillValidation(context.workspace, attempted) };
   console.log(JSON.stringify(result, null, 2));
   if (failures.length) process.exitCode = 1;
 }

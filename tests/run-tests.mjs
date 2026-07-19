@@ -224,23 +224,59 @@ try {
   assert.equal(fs.readFileSync(path.join(workspace, "skills/example/moved.txt"), "utf8"), "move me\n");
   assert.equal(fs.existsSync(path.join(workspace, "skills/example/remove.txt")), false);
   assert.equal(executed.skill_validation.attempted, true);
+
+  // Replacing an existing file is atomic: a failed rename leaves the original intact.
+  resetWorkspace();
+  const renameFailureHook = path.join(root, "rename-failure-hook.mjs");
+  write(renameFailureHook, [
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    "const renameSync = fs.renameSync;",
+    "fs.renameSync = function (source, destination) {",
+    "  if (path.resolve(destination) === process.env.AGENT_CLEANUP_FAIL_RENAME_TARGET) throw new Error(\"injected rename failure\");",
+    "  return renameSync.call(this, source, destination);",
+    "};",
+    "",
+  ].join("\n"));
+  const atomicPlan = createReviewedPlan("atomic-write", [finding("F150", [{
+    type: "write_file", path: "USER.md", content: "# User\n\nPrefers coffee.\n",
+  }])]);
+  const atomicResult = executePlan(atomicPlan, {
+    expected: 1,
+    env: {
+      AGENT_CLEANUP_FAIL_RENAME_TARGET: fs.realpathSync(path.join(workspace, "USER.md")),
+      NODE_OPTIONS: `--import=${renameFailureHook}`,
+    },
+  });
+  assert.equal(atomicResult.failures.length, 1);
+  assert.match(atomicResult.failures[0].error, /injected rename failure/);
+  assert.equal(fs.readFileSync(path.join(workspace, "USER.md"), "utf8"), "# User\n\nPrefers tea.\n");
+  assert.equal(fs.statSync(path.join(workspace, "USER.md")).mode & 0o777, 0o640);
+  assert.equal(fs.readdirSync(workspace).some((entry) => entry.includes(".agent-cleanup-") && entry.endsWith(".tmp")), false);
+
+  resetWorkspace();
+  executePlan(applyPlan);
   const preparedAgain = parse(run(scripts.apply, ["prepare", "--plan", applyPlan, "--workspace", workspace, "--backup-root", backups]));
   assert.notEqual(preparedAgain.backup_path, prepared.backup_path);
   const repeated = parse(run(scripts.apply, [
     "execute", "--plan", applyPlan, "--workspace", workspace, "--backup", preparedAgain.backup_path,
   ], { expected: 1 }));
-  assert.equal(repeated.successes.length + repeated.failures.length, 4);
+  assert.equal(repeated.successes.length + repeated.failures.length + repeated.skipped.length, 4);
 
-  // Invalid targets are rejected, and operation failures do not stop later work.
+  // A failed operation skips its semantic finding, but later findings still run.
   resetWorkspace();
-  const bestEffort = createReviewedPlan("best-effort", [finding("F200", [
+  const findingScoped = createReviewedPlan("finding-scoped", [finding("F200", [
     { type: "move_path", from: "skills/example/missing.txt", to: "skills/example/never.txt" },
-    { type: "write_file", path: "skills/example/created.txt", content: "still ran\n" },
+    { type: "write_file", path: "skills/example/created.txt", content: "must be skipped\n" },
+  ]), finding("F201", [
+    { type: "write_file", path: "MEMORY.md", content: "# Memory\n\nIndependent finding ran.\n" },
   ])]);
-  const result = executePlan(bestEffort, { expected: 1 });
+  const result = executePlan(findingScoped, { expected: 1 });
   assert.equal(result.failures.length, 1);
   assert.equal(result.successes.length, 1);
-  assert.equal(fs.readFileSync(path.join(workspace, "skills/example/created.txt"), "utf8"), "still ran\n");
+  assert.deepEqual(result.skipped, [{ operation: "F200:2:write_file", reason: "earlier operation failed in finding F200" }]);
+  assert.equal(fs.existsSync(path.join(workspace, "skills/example/created.txt")), false);
+  assert.equal(fs.readFileSync(path.join(workspace, "MEMORY.md"), "utf8"), "# Memory\n\nIndependent finding ran.\n");
 
   // Ordered operations may establish a parent used by a later operation.
   resetWorkspace();
@@ -381,7 +417,13 @@ try {
     type: "write_file", path: "skills/example/SKILL.md", content: "---\nname: example\ndescription: Still fixed.\n---\n",
   }])]);
   fs.rmSync(path.join(bin, "openclaw"));
-  const unavailableResult = executePlan(unavailablePlan);
+  const pathWithoutOpenClaw = [
+    bin,
+    ...process.env.PATH.split(path.delimiter).filter((directory) => (
+      directory && !fs.existsSync(path.join(directory, "openclaw"))
+    )),
+  ].join(path.delimiter);
+  const unavailableResult = executePlan(unavailablePlan, { env: { PATH: pathWithoutOpenClaw } });
   assert.equal(unavailableResult.skill_validation.available, false);
   assert.equal(unavailableResult.failures.length, 0);
 

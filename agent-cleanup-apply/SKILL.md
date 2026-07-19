@@ -31,13 +31,14 @@ Run:
 node {baseDir}/scripts/apply-run.mjs execute --plan <plan-path> --workspace <absolute-workspace-path> --backup <backup-path>
 ```
 
-Use the exact `backup_path` returned by prepare. The helper rejects execution without it and verifies that the archive's embedded cleanup plan is byte-for-byte identical to the plan being executed. The generic runner then attempts each operation from every `apply` finding in plan order. One failure does not stop later operations, and there is no automatic rollback. It preserves permissions when replacing a text file, creates ordinary non-executable text files, never overwrites move destinations, and never dereferences symlinks contained in moved or removed directories.
+Use the exact `backup_path` returned by prepare. The helper rejects execution without it and verifies that the archive's embedded cleanup plan is byte-for-byte identical to the plan being executed. The generic runner then attempts each operation from every `apply` finding in plan order. A failure skips the remaining operations in that finding, while later independent findings still run; there is no automatic rollback. It atomically replaces an existing text file through a same-directory temporary file while preserving its Unix permission mode, creates ordinary non-executable text files, never overwrites move destinations, and never dereferences symlinks contained in moved or removed directories.
 
 Report:
 
 - The verified `backup_path` returned by execute; it must match the path previously reported after prepare.
 - Every entry in `successes`.
 - Every entry in `failures` with its error.
+- Every entry in `skipped` with its reason.
 - The returned advisory `skill_validation` result. Skill Validation runs only when an attempted operation affects workspace-local skills. Failure or unavailability is reported without rollback.
 
 Do not persist a result artifact. Manual recovery from the backup is the operator's decision.
