@@ -16,7 +16,7 @@ Audit inspects the active workspace and creates one helper-owned `cleanup-plan.j
 
 Review runs in a separate invocation and presents one finding at a time. It rereads the affected workspace files, shows the before/after differences, and lets the operator refine the finding before choosing to apply, defer, or dismiss it. The same helper-owned JSON is updated until every finding has a decision.
 
-Apply treats the reviewed plan as read-only. It first creates a change-scoped `.tar.gz` containing the reviewed plan and the existing content at every path the plan will touch. After reporting the backup location, a generic runner attempts every approved operation exactly as recorded. Failures are reported but do not stop later operations or trigger automatic rollback.
+Apply treats the reviewed plan as read-only. It first creates a change-scoped external directory containing the reviewed plan and the existing content at every path the plan will touch. After reporting the backup location, a generic runner attempts every approved operation exactly as recorded. Failures are reported but do not stop later operations or trigger automatic rollback.
 
 ## User Stories
 
@@ -56,7 +56,7 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 34. As an OpenClaw operator, I want apply to execute exact reviewed file contents, so that it performs no fresh semantic reasoning.
 35. As an OpenClaw operator, I want apply limited to complete text-file writes, path moves, and path removals, so that its authority remains understandable.
 36. As an OpenClaw operator, I want a backup of every existing path apply will touch, so that I can manually recover changed content.
-37. As an OpenClaw operator, I want the reviewed plan included in the backup, so that the archive explains how to reverse creations and moves.
+37. As an OpenClaw operator, I want the reviewed plan included in the backup, so that the backup explains how to reverse creations and moves.
 38. As an OpenClaw operator, I want the backup location reported before modification, so that I know where recovery material lives.
 39. As an OpenClaw operator, I want explicit apply invocation to authorize execution, so that no redundant approval is required after backup.
 40. As an OpenClaw operator, I want later operations attempted after one operation fails, so that unrelated cleanup can still complete.
@@ -69,7 +69,7 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 ## Implementation Decisions
 
 - Implement three explicitly user-invoked skills named `agent-cleanup-audit`, `agent-cleanup-review`, and `agent-cleanup-apply`.
-- Each skill includes its own instructions and phase-specific Node.js helper. No installed phase imports code from a sibling skill or shared runtime library.
+- Each skill includes its own instructions and phase-specific Node.js helper. No installed phase imports code from a sibling skill or shared runtime library, and shipped helpers do not execute subprocesses.
 - Cleanup always targets the active workspace. Audit records its real absolute path in the plan; review and apply reject the plan when invoked from another workspace.
 - Store each plan in a timestamped directory beneath `OPENCLAW_STATE_DIR/agent-cleanup`, or beneath `OPENCLAW_HOME/.openclaw/agent-cleanup` when no explicit state directory is configured, outside the target workspace. Audit returns the exact plan path; review and apply require that path.
 - Do not add run IDs, run lookup, artifact listing, retention policies, pruning, schema versions, SHA seals, source manifests, drift detection, locks, or result artifacts.
@@ -78,7 +78,7 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 - The plan has only two lifecycle states: draft and reviewed. It becomes reviewed only when no finding remains pending. Adding or editing a finding returns the plan to draft.
 - A finding represents one semantic workspace problem rather than one file defect. It records a stable identifier, explanation, evidence paths and excerpts, uncertainty where relevant, intended outcome, decision, and ordered proposed operations.
 - Every finding includes exact proposed operations even when user judgment is required. Audit makes a conservative recommendation; review may revise, defer, or dismiss it.
-- Audit helper commands initialize the plan, add a finding, replace a finding, and finish the audit. The helper prevents duplicate finding identifiers and malformed paths or operations.
+- Audit helper commands initialize the plan, record the visible OpenClaw validation result, add a finding, replace a finding, and finish the audit. Initialization leaves validation pending; finish requires the skill to have recorded an outcome. The helper prevents duplicate finding identifiers and malformed paths or operations.
 - Review helper commands return the next pending finding, add a finding, replace a finding, record a decision, and finish review. Replacing a decided finding resets its decision to pending.
 - Review processes one finding at a time. Before presenting it, the skill rereads every affected live file and uses the live content to render before/after differences. The plan stores intended new content, not copies of old file content.
 - Review decisions are `apply`, `defer`, and `dismiss`. Only operations attached to applied findings are executed; deferred and dismissed findings retain their proposed operations as non-executed context.
@@ -94,7 +94,7 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 - Classify cruft as duplicate information, scoped contradictions, misplaced information, explicit supersession, affirmative semantic staleness, completed or invalid open loops, abandoned template content, operationally redundant wording, broken internal references, malformed skills, duplicate or overlapping skills, conflicting skills, affirmatively obsolete skills, and unreferenced local-skill files.
 - Compare contradictions only when subject, audience, conditions, scope, and time match. Prefer explicit corrections over inference, and use newer dated evidence only when it clearly records a changed fact or decision. Modification time alone is never evidence.
 - Do not classify content as cruft from age, modification time, file size, token count, verbosity alone, or stylistic preference.
-- Run the installed OpenClaw skill validator during audit when available and use its diagnostics as evidence. If unavailable, report that structural validation was skipped and continue.
+- Run the installed OpenClaw skill validator visibly through the agent's normal execution tool during audit when available, record its result through the audit helper, and use its diagnostics as evidence. If unavailable, record and report that structural validation was skipped and continue.
 - Do not collect skill-usage or inactivity data. A skill is obsolete only when affirmative workspace evidence supports that conclusion.
 - The cleanup operation set is `write_file`, `move_path`, and `remove_path`, executed in plan order.
 - `write_file` contains the complete approved final text. Replacing a file preserves its permissions; creating a file uses ordinary non-executable text-file permissions and requires an existing parent directory.
@@ -102,13 +102,13 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 - `remove_path` removes an existing file or directory without dereferencing symlinks contained beneath it.
 - Reject directory creation, direct symlink mutation, permission changes, binary rewriting, arbitrary commands, and paths outside the target workspace.
 - Apply's helper is a generic cleanup runner with separate `prepare` and `execute` commands. Both treat the reviewed plan as read-only.
-- `prepare` validates the reviewed plan and uses the system `tar` command to create a timestamped `.tar.gz` outside the workspace. The archive contains the reviewed plan and the complete pre-apply content at every existing path targeted by an applied write, move, or removal. Duplicate and nested touched paths are archived once.
-- If `tar` is unavailable or backup creation fails, prepare aborts and execute is not called.
-- After prepare, the skill reports the archive's exact path. Execute requires that path, extracts the embedded cleanup plan, and rejects execution unless it is byte-for-byte identical to the plan being executed. Explicit invocation of apply is already authorization, so no additional confirmation occurs.
+- `prepare` validates the reviewed plan and creates a timestamped directory outside the workspace using Node filesystem APIs. The directory contains the reviewed plan and the complete pre-apply content at every existing path targeted by an applied write, move, or removal. Duplicate and nested touched paths are copied once; no manifest or hashes are added.
+- If any backup copy fails, prepare removes the incomplete backup, aborts, and execute is not called.
+- After prepare, the skill reports the backup directory's exact path. Execute requires that path, reads the copied cleanup plan, and rejects execution unless it is byte-for-byte identical to the plan being executed. Explicit invocation of apply is already authorization, so no additional confirmation occurs.
 - `execute` attempts every applied operation in order. Failure of one operation is recorded and does not prevent later operations from being attempted. No automatic rollback or recovery verification occurs.
 - Reapplying a reviewed plan has no special replay protection. Each invocation creates a fresh change backup and attempts every operation again.
-- After execution, report the backup path, every successful operation, every failed operation with its error, and any validation result. Do not persist a separate result artifact.
-- When any attempted operation affects workspace-local skills, run the installed OpenClaw skill validator after execution. Report failure or unavailability without rollback. Knowledge-only changes receive no generic semantic validation after apply.
+- After execution, report the backup path, every successful operation, every failed operation with its error, and whether advisory Skill Validation is required. Do not persist a separate result artifact.
+- When any attempted operation affects workspace-local skills, the apply skill runs the installed OpenClaw skill validator visibly through the agent's normal execution tool after execution. Report failure or unavailability without rollback or persistence. Knowledge-only changes receive no generic semantic validation after apply.
 
 ## Testing Decisions
 
@@ -120,8 +120,8 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 - Verify direct malformed helper inputs are rejected without corrupting the existing plan.
 - Verify review and apply reject a plan belonging to a different active workspace.
 - Verify apply refuses a draft plan.
-- Verify prepare creates a readable `.tar.gz` containing the reviewed plan and pre-change content for every existing touched path, without including untouched workspace content.
-- Verify prepare fails before mutation when `tar` is unavailable or archive creation fails.
+- Verify prepare creates a readable directory containing the reviewed plan and pre-change content for every existing touched path, without including untouched workspace content or a manifest.
+- Verify prepare removes an incomplete backup and fails before mutation when a filesystem copy fails.
 - Verify complete text-file writes, new file creation, permission preservation, moves, and removals.
 - Verify out-of-workspace paths, directory creation, direct symlink operations, permission changes, binary writes, and arbitrary commands are rejected.
 - Verify operations outside Cleanup Scope, dated-memory targets, and agent-cleanup targets are rejected by audit, review, and apply, while both workspace-resident skill roots remain valid.
@@ -130,8 +130,9 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 - Verify repeated apply invocations create fresh backups and attempt the plan again.
 - Verify execute refuses a missing backup path or a backup containing a different cleanup plan.
 - Verify default plan and backup paths honor `OPENCLAW_STATE_DIR` and `OPENCLAW_HOME`.
-- Verify OpenClaw validation runs after local-skill changes, is skipped for knowledge-only changes, and reports failure or unavailability without rollback.
+- Verify execute requests visible OpenClaw validation after attempted local-skill changes and skips it for knowledge-only changes.
 - Verify the three skill distributions operate without sibling skill directories present.
+- Verify release validation rejects subprocess APIs in shipped skill support files.
 
 ## Out of Scope
 
@@ -162,3 +163,7 @@ Apply treats the reviewed plan as read-only. It first creates a change-scoped `.
 - Review obtains the before side of each comparison from the live workspace. Apply captures recovery content later in the change backup.
 - Manual recovery is an explicit design choice. The backup provides the original touched content and reviewed plan; the operator decides whether and how to restore it.
 - Simplicity is a core safety property: the workflow limits authority and keeps handoffs inspectable instead of attempting to provide transactional guarantees.
+
+## Comments
+
+- 2026-07-20: GitHub issue 1 exposed Skill Workshop's blanket quarantine of shipped Node subprocess APIs. Validation moved to visible agent execution, and the Change Backup became a direct external directory with no manifest or hashes; see ADR 0002.

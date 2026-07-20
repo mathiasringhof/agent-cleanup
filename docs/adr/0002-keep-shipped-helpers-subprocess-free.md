@@ -1,0 +1,3 @@
+# Keep shipped helpers subprocess-free
+
+Skill Workshop quarantines shipped support files that use Node subprocess APIs, even for fixed argument-vector commands. The audit and apply skills therefore run OpenClaw validation visibly through the agent's execution tool, while apply creates a unique uncompressed Change Backup directly with Node filesystem APIs and returns it only after every copy succeeds. The backup contains no manifest or hashes; execute preserves the earlier safety boundary by requiring the exact backup path and verifying that its copied Cleanup Plan is byte-for-byte identical to the reviewed plan before mutation.

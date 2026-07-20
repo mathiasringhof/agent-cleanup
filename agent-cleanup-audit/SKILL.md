@@ -17,7 +17,32 @@ Resolve the active workspace to its real absolute path, then run:
 node {baseDir}/scripts/audit-run.mjs init --workspace <absolute-workspace-path>
 ```
 
-The helper defaults beneath `OPENCLAW_STATE_DIR`, or beneath `OPENCLAW_HOME/.openclaw` when no explicit state directory is configured. Use `--plan-root <absolute-path>` only when the operator requested a different external state location. Keep the returned exact `plan_path`; review and apply require it. Read that plan's `skill_validation` entry and report when OpenClaw skill validation was unavailable or failed.
+The helper defaults beneath `OPENCLAW_STATE_DIR`, or beneath `OPENCLAW_HOME/.openclaw` when no explicit state directory is configured. Use `--plan-root <absolute-path>` only when the operator requested a different external state location. Keep the returned exact `plan_path`; review and apply require it.
+
+Run OpenClaw validation visibly through the normal execution tool from the active workspace:
+
+```bash
+openclaw skills check --json
+```
+
+Do not run this command through the helper. Capture its availability, exit code, stdout, and stderr in a temporary JSON file with this exact shape:
+
+```json
+{
+  "available": true,
+  "exit_code": 0,
+  "stdout": "...",
+  "stderr": ""
+}
+```
+
+Use `available: false` and `exit_code: null` when the command is unavailable. Record the captured result, including failed validation, through the helper:
+
+```bash
+node {baseDir}/scripts/audit-run.mjs record-validation --plan <plan-path> --file <validation-json>
+```
+
+The audit cannot be finished until a validation outcome has been recorded. Report when validation was unavailable or failed.
 
 ## Inspect the cleanup scope
 

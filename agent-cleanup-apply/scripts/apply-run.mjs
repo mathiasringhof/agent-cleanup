@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -22,6 +21,10 @@ function parseArgs(argv) {
 }
 
 function fail(message) { throw new Error(message); }
+
+function filesystemPathIsWithin(candidate, root) {
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
 
 function expandTilde(value, home) {
   if (value === "~") return home;
@@ -113,7 +116,7 @@ function loadPlan(options) {
   const plan = JSON.parse(planContents);
   const workspace = fs.realpathSync(path.resolve(options.workspace));
   if (plan.workspace !== workspace) fail("cleanup plan belongs to a different workspace");
-  if (planPath === workspace || planPath.startsWith(`${workspace}${path.sep}`)) fail("cleanup plan must stay outside the workspace");
+  if (filesystemPathIsWithin(planPath, workspace)) fail("cleanup plan must stay outside the workspace");
   if (plan.state !== "reviewed" || !plan.audit_complete || !Array.isArray(plan.findings)) fail("apply requires a reviewed cleanup plan");
   const operations = [];
   for (const finding of plan.findings) {
@@ -143,33 +146,47 @@ function existingBackupRoots(workspace, operations) {
   return unique.filter((candidate, index) => !unique.slice(0, index).some((parent) => candidate.startsWith(`${parent}/`)));
 }
 
+function resolvePotentialPath(candidate) {
+  let existing = candidate;
+  const missingParts = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) fail(`cannot resolve path: ${candidate}`);
+    missingParts.unshift(path.basename(existing));
+    existing = parent;
+  }
+  return path.join(fs.realpathSync(existing), ...missingParts);
+}
+
 function prepare(options) {
   const context = loadPlan(options);
   const requestedRoot = path.resolve(options["backup-root"] || path.join(openClawStateDirectory(), "agent-cleanup", "backups"));
+  const resolvedRequestedRoot = resolvePotentialPath(requestedRoot);
+  if (filesystemPathIsWithin(resolvedRequestedRoot, context.workspace)) fail("backup root must be outside the workspace");
   fs.mkdirSync(requestedRoot, { recursive: true, mode: 0o700 });
   const backupRoot = fs.realpathSync(requestedRoot);
-  if (backupRoot === context.workspace || backupRoot.startsWith(`${context.workspace}${path.sep}`)) fail("backup root must be outside the workspace");
-  const staging = fs.mkdtempSync(path.join(backupRoot, ".prepare-"));
+  if (filesystemPathIsWithin(backupRoot, context.workspace)) fail("backup root must be outside the workspace");
   const stamp = new Date().toISOString().replaceAll(":", "-").replace(".", "-");
-  const archivePath = path.join(backupRoot, `agent-cleanup-${stamp}-${crypto.randomBytes(4).toString("hex")}.tar.gz`);
+  const backupPath = path.join(backupRoot, `agent-cleanup-${stamp}-${crypto.randomBytes(4).toString("hex")}`);
+  fs.mkdirSync(backupPath, { mode: 0o700 });
   try {
-    fs.copyFileSync(context.planPath, path.join(staging, "cleanup-plan.json"));
-    fs.mkdirSync(path.join(staging, "workspace"), { mode: 0o700 });
+    fs.writeFileSync(path.join(backupPath, "cleanup-plan.json"), context.planContents, { mode: 0o600, flag: "wx" });
+    fs.mkdirSync(path.join(backupPath, "workspace"), { mode: 0o700 });
     const roots = existingBackupRoots(context.workspace, context.operations);
     for (const relative of roots) {
-      const destination = path.join(staging, "workspace", relative);
+      const destination = path.join(backupPath, "workspace", relative);
       fs.mkdirSync(path.dirname(destination), { recursive: true });
-      fs.cpSync(path.join(context.workspace, relative), destination, { recursive: true, dereference: false, preserveTimestamps: true });
+      fs.cpSync(path.join(context.workspace, relative), destination, {
+        recursive: true,
+        dereference: false,
+        preserveTimestamps: true,
+        verbatimSymlinks: true,
+      });
     }
-    const tar = spawnSync("tar", ["-czf", archivePath, "-C", staging, "cleanup-plan.json", "workspace"], { encoding: "utf8" });
-    if (tar.error) fail(`backup creation failed: ${tar.error.message}`);
-    if (tar.status !== 0) fail(`backup creation failed: ${(tar.stderr || tar.stdout).trim() || `tar exited ${tar.status}`}`);
-    console.log(JSON.stringify({ backup_path: archivePath, paths: roots }, null, 2));
+    console.log(JSON.stringify({ backup_path: backupPath, paths: roots }, null, 2));
   } catch (error) {
-    try { fs.rmSync(archivePath, { force: true }); } catch { /* preserve original error */ }
+    try { fs.rmSync(backupPath, { recursive: true, force: true }); } catch { /* preserve original error */ }
     throw error;
-  } finally {
-    fs.rmSync(staging, { recursive: true, force: true });
   }
 }
 
@@ -182,15 +199,11 @@ function verifyPreparedBackup(context, options) {
   const backupPath = path.resolve(options.backup);
   if (fs.lstatSync(backupPath).isSymbolicLink()) fail("change backup cannot be a symlink");
   const realBackupPath = fs.realpathSync(backupPath);
-  if (!fs.statSync(realBackupPath).isFile()) fail("change backup must be a regular file");
-  if (realBackupPath === context.workspace || realBackupPath.startsWith(`${context.workspace}${path.sep}`)) fail("change backup must stay outside the workspace");
-  const planContents = context.planContents;
-  const extracted = spawnSync("tar", ["-xOzf", realBackupPath, "cleanup-plan.json"], {
-    maxBuffer: Math.max(10 * 1024 * 1024, planContents.length * 2),
-  });
-  if (extracted.error) fail(`change backup verification failed: ${extracted.error.message}`);
-  if (extracted.status !== 0) fail(`change backup verification failed: ${extracted.stderr.toString().trim() || `tar exited ${extracted.status}`}`);
-  if (!planContents.equals(extracted.stdout)) fail("change backup contains a different cleanup plan");
+  if (!fs.statSync(realBackupPath).isDirectory()) fail("change backup must be a directory");
+  if (filesystemPathIsWithin(realBackupPath, context.workspace)) fail("change backup must stay outside the workspace");
+  const copiedPlan = path.join(realBackupPath, "cleanup-plan.json");
+  if (fs.lstatSync(copiedPlan).isSymbolicLink() || !fs.statSync(copiedPlan).isFile()) fail("change backup cleanup plan must be a regular file");
+  if (!context.planContents.equals(fs.readFileSync(copiedPlan))) fail("change backup contains a different cleanup plan");
   return realBackupPath;
 }
 
@@ -243,19 +256,10 @@ function executeOperation(workspace, operation) {
   }
 }
 
-function skillValidation(workspace, operations) {
-  const changesSkills = operations.some(({ operation }) => operationPaths(operation).some((relative) => (
+function skillValidationRequired(operations) {
+  return operations.some(({ operation }) => operationPaths(operation).some((relative) => (
     relative.startsWith("skills/") || relative.startsWith(".agents/skills/")
   )));
-  if (!changesSkills) return { attempted: false, available: null, exit_code: null, stdout: "", stderr: "" };
-  const result = spawnSync("openclaw", ["skills", "check", "--json"], { cwd: workspace, encoding: "utf8", timeout: 30_000 });
-  return {
-    attempted: true,
-    available: result.error?.code !== "ENOENT",
-    exit_code: result.error?.code === "ENOENT" ? null : result.status,
-    stdout: result.stdout || "",
-    stderr: result.stderr || result.error?.message || "",
-  };
 }
 
 function execute(options) {
@@ -281,7 +285,13 @@ function execute(options) {
       failedFindingIds.add(item.findingId);
     }
   }
-  const result = { backup_path: backupPath, successes, failures, skipped, skill_validation: skillValidation(context.workspace, attempted) };
+  const result = {
+    backup_path: backupPath,
+    successes,
+    failures,
+    skipped,
+    skill_validation_required: skillValidationRequired(attempted),
+  };
   console.log(JSON.stringify(result, null, 2));
   if (failures.length) process.exitCode = 1;
 }

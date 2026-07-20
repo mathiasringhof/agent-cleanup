@@ -57,8 +57,8 @@ One independently installable audit, review, or apply skill containing its own i
 _Avoid_: Plugin suite, shared installation
 
 **Change Backup**:
-A `.tar.gz` archive containing the reviewed plan and the pre-apply content at every existing path that the plan will modify, move, or remove. It does not contain untouched workspace content and supports manual rather than automatic recovery. Apply execution requires its exact path and verifies that its embedded plan is byte-for-byte identical to the plan being executed.
-_Avoid_: Workspace snapshot, full backup
+An external directory containing the reviewed plan and the pre-apply content at every existing path that the plan will modify, move, or remove. It does not contain untouched workspace content and supports manual rather than automatic recovery. Apply execution requires its exact path and verifies that its copied plan is byte-for-byte identical to the plan being executed.
+_Avoid_: Workspace snapshot, full backup, backup manifest
 
 **Apply Authorization**:
 The operator's explicit invocation of apply for a reviewed plan. No additional confirmation is required after the change backup succeeds.

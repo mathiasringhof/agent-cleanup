@@ -13,12 +13,19 @@ const scripts = {
   review: path.join(repo, "agent-cleanup-review/scripts/review-run.mjs"),
   apply: path.join(repo, "agent-cleanup-apply/scripts/apply-run.mjs"),
 };
+const releaseScript = path.join(repo, "scripts/prepare-release.mjs");
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-cleanup-core-"));
 const workspace = path.join(root, "workspace");
 const otherWorkspace = path.join(root, "other-workspace");
 const plans = path.join(root, "plans");
 const backups = path.join(root, "backups");
 const bin = path.join(root, "bin");
+const successfulValidation = {
+  available: true,
+  exit_code: 0,
+  stdout: "validated\n",
+  stderr: "",
+};
 
 function write(file, contents, mode) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -62,9 +69,13 @@ function finding(id, operations, overrides = {}) {
 }
 
 function initPlan(label = "plan") {
-  return parse(run(scripts.audit, [
+  const plan = parse(run(scripts.audit, [
     "init", "--workspace", workspace, "--plan-root", path.join(plans, label),
   ])).plan_path;
+  run(scripts.audit, [
+    "record-validation", "--plan", plan, "--file", jsonFile("validation", successfulValidation),
+  ]);
+  return plan;
 }
 
 function add(plan, value) {
@@ -137,9 +148,22 @@ try {
   })).plan_path;
   assert.ok(homePlan.startsWith(`${path.join(fs.realpathSync(configuredHome), ".openclaw", "agent-cleanup")}${path.sep}`));
 
+  // Audit records validation performed visibly by the skill rather than executing it in the helper.
+  const validationPlan = parse(run(scripts.audit, [
+    "init", "--workspace", workspace, "--plan-root", path.join(plans, "validation"),
+  ])).plan_path;
+  let plan = JSON.parse(fs.readFileSync(validationPlan, "utf8"));
+  assert.equal(plan.skill_validation, null);
+  run(scripts.audit, ["finish", "--plan", validationPlan], { expected: 1 });
+  run(scripts.audit, [
+    "record-validation", "--plan", validationPlan, "--file", jsonFile("validation", successfulValidation),
+  ]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(validationPlan, "utf8")).skill_validation, successfulValidation);
+  finishAudit(validationPlan);
+
   // Audit owns plan creation and validates every mutation.
   const auditPlan = initPlan("audit");
-  let plan = JSON.parse(fs.readFileSync(auditPlan, "utf8"));
+  plan = JSON.parse(fs.readFileSync(auditPlan, "utf8"));
   assert.equal(plan.workspace, fs.realpathSync(workspace));
   assert.equal(plan.state, "draft");
   assert.deepEqual(plan.findings, []);
@@ -172,7 +196,7 @@ try {
   decide(auditPlan, "F001", "dismiss");
   finishReview(auditPlan);
 
-  // Apply refuses drafts and prepares a change-scoped archive before mutation.
+  // Apply refuses drafts and prepares a change-scoped directory before mutation.
   const draft = initPlan("draft");
   run(scripts.apply, ["prepare", "--plan", draft, "--workspace", workspace, "--backup-root", backups], { expected: 1 });
   resetWorkspace();
@@ -183,15 +207,20 @@ try {
     { type: "remove_path", path: "skills/example/remove.txt" },
   ])]);
   run(scripts.apply, ["prepare", "--plan", applyPlan, "--workspace", otherWorkspace, "--backup-root", backups], { expected: 1 });
+  const workspaceBackupRoot = path.join(workspace, "forbidden-backups");
+  run(scripts.apply, ["prepare", "--plan", applyPlan, "--workspace", workspace, "--backup-root", workspaceBackupRoot], { expected: 1 });
+  assert.equal(fs.existsSync(workspaceBackupRoot), false);
   const prepared = parse(run(scripts.apply, ["prepare", "--plan", applyPlan, "--workspace", workspace, "--backup-root", backups]));
-  assert.ok(fs.existsSync(prepared.backup_path));
-  const archive = spawnSync("tar", ["-tzf", prepared.backup_path], { encoding: "utf8" });
-  assert.equal(archive.status, 0);
-  assert.match(archive.stdout, /cleanup-plan\.json/);
-  assert.match(archive.stdout, /workspace\/USER\.md/);
-  assert.match(archive.stdout, /workspace\/skills\/example\/old\.txt/);
-  assert.match(archive.stdout, /workspace\/skills\/example\/remove\.txt/);
-  assert.doesNotMatch(archive.stdout, /untouched\.txt/);
+  assert.equal(fs.statSync(prepared.backup_path).isDirectory(), true);
+  assert.equal(
+    fs.readFileSync(path.join(prepared.backup_path, "cleanup-plan.json"), "utf8"),
+    fs.readFileSync(applyPlan, "utf8"),
+  );
+  assert.equal(fs.readFileSync(path.join(prepared.backup_path, "workspace/USER.md"), "utf8"), "# User\n\nPrefers tea.\n");
+  assert.equal(fs.readFileSync(path.join(prepared.backup_path, "workspace/skills/example/old.txt"), "utf8"), "move me\n");
+  assert.equal(fs.readFileSync(path.join(prepared.backup_path, "workspace/skills/example/remove.txt"), "utf8"), "remove me\n");
+  assert.equal(fs.existsSync(path.join(prepared.backup_path, "workspace/skills/example/untouched.txt")), false);
+  assert.equal(fs.existsSync(path.join(prepared.backup_path, "manifest.json")), false);
   assert.equal(fs.readFileSync(path.join(workspace, "USER.md"), "utf8"), "# User\n\nPrefers tea.\n");
 
   run(scripts.apply, ["execute", "--plan", applyPlan, "--workspace", workspace], { expected: 1 });
@@ -223,7 +252,7 @@ try {
   assert.equal(fs.statSync(path.join(workspace, "skills/example/created.txt")).mode & 0o111, 0);
   assert.equal(fs.readFileSync(path.join(workspace, "skills/example/moved.txt"), "utf8"), "move me\n");
   assert.equal(fs.existsSync(path.join(workspace, "skills/example/remove.txt")), false);
-  assert.equal(executed.skill_validation.attempted, true);
+  assert.equal(executed.skill_validation_required, true);
 
   // Replacing an existing file is atomic: a failed rename leaves the original intact.
   resetWorkspace();
@@ -249,6 +278,7 @@ try {
     },
   });
   assert.equal(atomicResult.failures.length, 1);
+  assert.equal(atomicResult.skill_validation_required, false);
   assert.match(atomicResult.failures[0].error, /injected rename failure/);
   assert.equal(fs.readFileSync(path.join(workspace, "USER.md"), "utf8"), "# User\n\nPrefers tea.\n");
   assert.equal(fs.statSync(path.join(workspace, "USER.md")).mode & 0o777, 0o640);
@@ -394,15 +424,13 @@ try {
   assert.match(liveResult.failures[0].error, /symlink/);
   assert.equal(fs.readFileSync(external, "utf8"), "outside\n");
 
-  // Skill Validation is advisory on failure and unavailability.
+  // Execute reports whether the skill must perform visible advisory validation.
   resetWorkspace();
   const skillPlan = createReviewedPlan("skill", [finding("F400", [{
     type: "write_file", path: "skills/example/SKILL.md", content: "---\nname: example\ndescription: Fixed.\n---\n",
   }])]);
-  write(path.join(bin, "openclaw"), "#!/bin/sh\nprintf 'validator failed\\n' >&2\nexit 7\n", 0o755);
   const skillResult = executePlan(skillPlan);
-  assert.equal(skillResult.skill_validation.available, true);
-  assert.equal(skillResult.skill_validation.exit_code, 7);
+  assert.equal(skillResult.skill_validation_required, true);
   assert.equal(skillResult.failures.length, 0);
   resetWorkspace();
   write(path.join(workspace, ".agents/skills/example/existing.txt"), "project-agent skill\n");
@@ -410,22 +438,24 @@ try {
     type: "write_file", path: ".agents/skills/example/SKILL.md", content: "---\nname: example\ndescription: Project agent skill.\n---\n",
   }])]);
   const projectAgentSkillResult = executePlan(projectAgentSkillPlan);
-  assert.equal(projectAgentSkillResult.skill_validation.attempted, true);
-  assert.equal(projectAgentSkillResult.skill_validation.exit_code, 7);
-  resetWorkspace();
-  const unavailablePlan = createReviewedPlan("skill-unavailable", [finding("F402", [{
-    type: "write_file", path: "skills/example/SKILL.md", content: "---\nname: example\ndescription: Still fixed.\n---\n",
-  }])]);
-  fs.rmSync(path.join(bin, "openclaw"));
-  const pathWithoutOpenClaw = [
-    bin,
-    ...process.env.PATH.split(path.delimiter).filter((directory) => (
-      directory && !fs.existsSync(path.join(directory, "openclaw"))
-    )),
-  ].join(path.delimiter);
-  const unavailableResult = executePlan(unavailablePlan, { env: { PATH: pathWithoutOpenClaw } });
-  assert.equal(unavailableResult.skill_validation.available, false);
-  assert.equal(unavailableResult.failures.length, 0);
+  assert.equal(projectAgentSkillResult.skill_validation_required, true);
+
+  // Release validation rejects subprocess APIs in shipped support files.
+  const releaseFixture = path.join(root, "release-fixture");
+  write(path.join(releaseFixture, "scripts/prepare-release.mjs"), fs.readFileSync(releaseScript, "utf8"));
+  for (const [phase] of Object.entries(scripts)) {
+    write(path.join(releaseFixture, `agent-cleanup-${phase}/SKILL.md`), `---\nname: agent-cleanup-${phase}\ndescription: Fixture.\n---\n`);
+    write(path.join(releaseFixture, `agent-cleanup-${phase}/scripts/${phase}-run.mjs`), "#!/usr/bin/env node\n");
+  }
+  const forbiddenSupport = path.join(releaseFixture, "agent-cleanup-audit/scripts/audit-run.mjs");
+  write(forbiddenSupport, 'import { spawnSync } from "node:child_process";\nspawnSync("openclaw", []);\n');
+  run(path.join(releaseFixture, "scripts/prepare-release.mjs"), [], { expected: 1 });
+  write(forbiddenSupport, "#!/usr/bin/env node\n");
+  const forbiddenReference = path.join(releaseFixture, "agent-cleanup-audit/references/forbidden.mjs");
+  write(forbiddenReference, 'import { execFile } from "node:child_process";\nexecFile("openclaw", []);\n');
+  run(path.join(releaseFixture, "scripts/prepare-release.mjs"), [], { expected: 1 });
+  write(forbiddenReference, "export const safe = true;\n");
+  run(path.join(releaseFixture, "scripts/prepare-release.mjs"), []);
 
   // Each distribution works with no sibling directories present.
   for (const [phase, source] of Object.entries(scripts)) {
@@ -436,13 +466,29 @@ try {
     assert.doesNotMatch(result.stderr, /ERR_MODULE_NOT_FOUND/);
   }
 
-  // Tar failure aborts prepare without touching the workspace.
+  // A backup copy failure removes the incomplete backup and leaves the workspace untouched.
   resetWorkspace();
-  const tarPlan = createReviewedPlan("tar-failure", [finding("F500", [{ type: "remove_path", path: "skills/example/remove.txt" }])]);
-  run(scripts.apply, ["prepare", "--plan", tarPlan, "--workspace", workspace, "--backup-root", backups], { expected: 1, env: { PATH: bin } });
-  assert.equal(fs.existsSync(path.join(workspace, "skills/example/remove.txt")), true);
-  write(path.join(bin, "tar"), "#!/bin/sh\nprintf 'archive failed\\n' >&2\nexit 9\n", 0o755);
-  run(scripts.apply, ["prepare", "--plan", tarPlan, "--workspace", workspace, "--backup-root", backups], { expected: 1, env: { PATH: bin } });
+  const copyFailurePlan = createReviewedPlan("copy-failure", [finding("F500", [{ type: "remove_path", path: "skills/example/remove.txt" }])]);
+  const copyFailureHook = path.join(root, "copy-failure-hook.mjs");
+  write(copyFailureHook, [
+    'import fs from "node:fs";',
+    'import path from "node:path";',
+    "const cpSync = fs.cpSync;",
+    "fs.cpSync = function (source, destination, options) {",
+    "  if (path.resolve(source) === process.env.AGENT_CLEANUP_FAIL_COPY_SOURCE) throw new Error(\"injected copy failure\");",
+    "  return cpSync.call(this, source, destination, options);",
+    "};",
+    "",
+  ].join("\n"));
+  const backupsBeforeFailure = fs.readdirSync(backups).sort();
+  run(scripts.apply, ["prepare", "--plan", copyFailurePlan, "--workspace", workspace, "--backup-root", backups], {
+    expected: 1,
+    env: {
+      AGENT_CLEANUP_FAIL_COPY_SOURCE: fs.realpathSync(path.join(workspace, "skills/example/remove.txt")),
+      NODE_OPTIONS: `--import=${copyFailureHook}`,
+    },
+  });
+  assert.deepEqual(fs.readdirSync(backups).sort(), backupsBeforeFailure);
   assert.equal(fs.existsSync(path.join(workspace, "skills/example/remove.txt")), true);
 
   console.log("all tests passed");

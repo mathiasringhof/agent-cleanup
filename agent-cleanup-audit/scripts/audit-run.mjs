@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -159,16 +158,6 @@ function validateFinding(finding, workspace) {
   }
 }
 
-function skillValidation(workspace) {
-  const result = spawnSync("openclaw", ["skills", "check", "--json"], { cwd: workspace, encoding: "utf8", timeout: 30_000 });
-  return {
-    available: result.error?.code !== "ENOENT",
-    exit_code: result.error?.code === "ENOENT" ? null : result.status,
-    stdout: result.stdout || "",
-    stderr: result.stderr || result.error?.message || "",
-  };
-}
-
 function loadMutable(options) {
   if (!options.plan) fail("--plan is required");
   const planPath = path.resolve(options.plan);
@@ -197,10 +186,26 @@ function init(options) {
     workspace,
     state: "draft",
     audit_complete: false,
-    skill_validation: skillValidation(workspace),
+    skill_validation: null,
     findings: [],
   });
   console.log(JSON.stringify({ plan_path: planPath, workspace }, null, 2));
+}
+
+function recordValidation(options) {
+  if (!options.file) fail("record-validation requires --file");
+  const { planPath, plan } = loadMutable(options);
+  const validation = readJson(path.resolve(options.file));
+  if (!validation || typeof validation !== "object" || Array.isArray(validation)) fail("skill validation must be an object");
+  const allowed = new Set(["available", "exit_code", "stdout", "stderr"]);
+  for (const key of Object.keys(validation)) if (!allowed.has(key)) fail(`unsupported skill validation field: ${key}`);
+  if (typeof validation.available !== "boolean") fail("skill validation available must be a boolean");
+  if (validation.exit_code !== null && !Number.isInteger(validation.exit_code)) fail("skill validation exit_code must be an integer or null");
+  if (!validation.available && validation.exit_code !== null) fail("unavailable skill validation cannot have an exit code");
+  if (typeof validation.stdout !== "string" || typeof validation.stderr !== "string") fail("skill validation output must be text");
+  plan.skill_validation = validation;
+  writeJson(planPath, plan);
+  console.log(JSON.stringify({ skill_validation: validation }, null, 2));
 }
 
 function addFinding(options) {
@@ -228,6 +233,7 @@ function replaceFinding(options) {
 
 function finish(options) {
   const { planPath, plan } = loadMutable(options);
+  if (plan.skill_validation === null) fail("audit requires a recorded skill validation outcome");
   plan.audit_complete = true;
   writeJson(planPath, plan);
   console.log(JSON.stringify({ plan_path: planPath, findings: plan.findings.length }, null, 2));
@@ -236,10 +242,11 @@ function finish(options) {
 const options = parseArgs(process.argv.slice(2));
 try {
   if (options._[0] === "init") init(options);
+  else if (options._[0] === "record-validation") recordValidation(options);
   else if (options._[0] === "add-finding") addFinding(options);
   else if (options._[0] === "replace-finding") replaceFinding(options);
   else if (options._[0] === "finish") finish(options);
-  else fail("usage: audit-run.mjs <init|add-finding|replace-finding|finish> ...");
+  else fail("usage: audit-run.mjs <init|record-validation|add-finding|replace-finding|finish> ...");
 } catch (error) {
   console.error(`error: ${error.message}`);
   process.exitCode = 1;
